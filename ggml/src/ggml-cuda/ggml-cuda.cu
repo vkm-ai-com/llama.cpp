@@ -191,7 +191,7 @@ static __global__ void sinq_scale_matrix_rows_kernel(
     }
 
     const int64_t index = row * ncols + col;
-    const float scaled = sinq_scale_to_float(data[index]) * scales[row];
+    const float scaled = sinq_scale_to_float(data[index]) * scales[col];
     data[index] = sinq_scale_from_float<T>(scaled);
 }
 
@@ -2310,7 +2310,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     if (apply_sinq_row) {
         GGML_ASSERT(dst->type == GGML_TYPE_F32);
-        GGML_ASSERT((int64_t) sinq_row->size() == src0->ne[1]);
+        GGML_ASSERT((int64_t) sinq_row->size() == dst->ne[0]);
 
         float * row_dev = sinq_row_dev.alloc(ctx.pool(), sinq_row->size());
         CUDA_CHECK(cudaMemcpyAsync(row_dev, sinq_row->data(),
