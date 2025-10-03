@@ -2230,7 +2230,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         src1_sinq.nb[2]  = src1_sinq.nb[1] * src1_sinq.ne[1];
         src1_sinq.nb[3]  = src1_sinq.nb[2] * src1_sinq.ne[2];
 
-        ggml_cuda_cpy(ctx, src1, &src1_sinq);
+        // Disable copy indirection here because this temporary tensor is not a
+        // persistent graph node.  Otherwise CUDA graph capture would assume an
+        // extra GGML_OP_CPY node, leading to pointer indirection bookkeeping
+        // mismatches the next time the graph is replayed (e.g. during the
+        // server warmup decode), effectively stalling execution.
+        ggml_cuda_cpy(ctx, src1, &src1_sinq, /*disable_indirection_for_this_node=*/true);
 
         float * col_dev = sinq_col_dev.alloc(ctx.pool(), sinq_col->size());
         CUDA_CHECK(cudaMemcpyAsync(col_dev, sinq_col->data(),
