@@ -2164,8 +2164,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     ggml_tensor src1_sinq = *src1;
     const ggml_tensor * src1_compute = src1;
-    ggml_cuda_pool_alloc<float> sinq_col_dev;
-    ggml_cuda_pool_alloc<float> sinq_row_dev;
+    ggml_cuda_pool_alloc<float>       sinq_col_dev;
+    ggml_cuda_pool_alloc<float>       sinq_row_dev;
+    ggml_cuda_pool_alloc<float>       sinq_src1_dev_f32;
+    ggml_cuda_pool_alloc<half>        sinq_src1_dev_f16;
+    ggml_cuda_pool_alloc<nv_bfloat16> sinq_src1_dev_bf16;
 
     if (apply_sinq_col) {
         GGML_ASSERT((int64_t) sinq_col->size() == src0->ne[0]);
@@ -2173,10 +2176,6 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         const int64_t nelements_src1 = ggml_nelements(src1);
 
         void * src1_tmp = nullptr;
-        ggml_cuda_pool_alloc<float>        sinq_src1_dev_f32;
-        ggml_cuda_pool_alloc<half>         sinq_src1_dev_f16;
-        ggml_cuda_pool_alloc<nv_bfloat16>  sinq_src1_dev_bf16;
-
         switch (src1->type) {
             case GGML_TYPE_F32:
                 src1_tmp = sinq_src1_dev_f32.alloc(ctx.pool(), nelements_src1);
