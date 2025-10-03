@@ -66,9 +66,10 @@ COPY --from=build /app/lib/ /app
 ### Full
 FROM base AS full
 
-COPY --from=build /app/full /app
-
 WORKDIR /app
+
+COPY requirements.txt /app/requirements.txt
+COPY requirements /app/requirements
 
 RUN --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     --mount=type=cache,target=/var/cache/apt,sharing=locked \
@@ -86,6 +87,8 @@ RUN --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     && rm -rf /tmp/* /var/tmp/* \
     && find /var/cache/apt/archives /var/lib/apt/lists -not -name lock -type f -delete \
     && find /var/cache -type f -delete
+
+COPY --from=build /app/full /app
 
 
 ENTRYPOINT ["/app/tools.sh"]
