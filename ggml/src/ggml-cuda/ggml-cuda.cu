@@ -3400,6 +3400,9 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
         } else {
             graph_evaluated_or_captured = true; // ggml graph has been directly evaluated
         }
+#else
+        graph_evaluated_or_captured = true; // CUDA graphs disabled at compile time
+#endif // USE_CUDA_GRAPH
     }
 
 #ifdef USE_CUDA_GRAPH
