@@ -2203,7 +2203,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // weight buffer instead of our scratch allocation, which prevents the kernel
     // launches from ever executing and effectively stalls inference.
     src1_sinq.extra     = nullptr;
-    src1_sinq.buffer    = nullptr;
+    // keep the original backend buffer (intentionally not cleared) so
+    // downstream CUDA helpers can inspect the tensor's device placement.
+    // only the data pointer is redirected to the temporary scratch
+    // allocation below.
     src1_sinq.view_src  = nullptr;
     src1_sinq.view_offs = 0;
     src1_sinq.op        = GGML_OP_NONE;
