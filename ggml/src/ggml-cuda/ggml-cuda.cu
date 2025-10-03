@@ -162,7 +162,7 @@ __device__ inline nv_bfloat16 sinq_scale_from_float(float value) {
 }
 
 template <typename T>
-static __global__ void sinq_scale_matrix_kernel(
+static __global__ void sinq_scale_matrix_cols_kernel(
         T * data,
         const float * scales,
         int64_t ncols,
@@ -175,6 +175,23 @@ static __global__ void sinq_scale_matrix_kernel(
 
     const int64_t index = row * ncols + col;
     const float scaled = sinq_scale_to_float(data[index]) * scales[col];
+    data[index] = sinq_scale_from_float<T>(scaled);
+}
+
+template <typename T>
+static __global__ void sinq_scale_matrix_rows_kernel(
+        T * data,
+        const float * scales,
+        int64_t ncols,
+        int64_t nrows) {
+    const int64_t col = blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t row = blockIdx.y * blockDim.y + threadIdx.y;
+    if (col >= ncols || row >= nrows) {
+        return;
+    }
+
+    const int64_t index = row * ncols + col;
+    const float scaled = sinq_scale_to_float(data[index]) * scales[row];
     data[index] = sinq_scale_from_float<T>(scaled);
 }
 
@@ -2192,15 +2209,15 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
                      (unsigned) ((nrows + blockDim.y - 1) / blockDim.y));
         switch (src1->type) {
             case GGML_TYPE_F32:
-                sinq_scale_matrix_kernel<<<gridDim, blockDim, 0, ctx.stream()>>>(
+                sinq_scale_matrix_cols_kernel<<<gridDim, blockDim, 0, ctx.stream()>>>(
                         static_cast<float *>(src1_tmp), col_dev, ncols, nrows);
                 break;
             case GGML_TYPE_F16:
-                sinq_scale_matrix_kernel<<<gridDim, blockDim, 0, ctx.stream()>>>(
+                sinq_scale_matrix_cols_kernel<<<gridDim, blockDim, 0, ctx.stream()>>>(
                         static_cast<half *>(src1_tmp), col_dev, ncols, nrows);
                 break;
             case GGML_TYPE_BF16:
-                sinq_scale_matrix_kernel<<<gridDim, blockDim, 0, ctx.stream()>>>(
+                sinq_scale_matrix_cols_kernel<<<gridDim, blockDim, 0, ctx.stream()>>>(
                         static_cast<nv_bfloat16 *>(src1_tmp), col_dev, ncols, nrows);
                 break;
             default:
@@ -2305,7 +2322,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         dim3 blockDim(32, 32);
         dim3 gridDim((unsigned) ((ncols_dst + blockDim.x - 1) / blockDim.x),
                      (unsigned) ((nrows_dst + blockDim.y - 1) / blockDim.y));
-        sinq_scale_matrix_kernel<<<gridDim, blockDim, 0, ctx.stream()>>>((float *) dst->data, row_dev, ncols_dst, nrows_dst);
+        sinq_scale_matrix_rows_kernel<<<gridDim, blockDim, 0, ctx.stream()>>>((float *) dst->data, row_dev, ncols_dst, nrows_dst);
     }
 }
 
