@@ -68,7 +68,8 @@ FROM base AS full
 
 WORKDIR /app
 
-COPY requirements.txt requirements/ ./
+COPY requirements.txt /app/requirements.txt
+COPY requirements /app/requirements
 
 RUN --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     --mount=type=cache,target=/var/cache/apt,sharing=locked \
