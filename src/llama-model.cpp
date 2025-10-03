@@ -379,11 +379,35 @@ ggml_tensor * llama_model::mul_mat_with_sinq(ggml_context * ctx, ggml_tensor * w
         return ggml_mul_mat(ctx, weight, input);
     }
 
+    const std::vector<float> * col_scales = &scales->col;
+    const std::vector<float> * row_scales = &scales->row;
+
+    const bool matches_direct =
+        (col_scales->empty() || (int64_t) col_scales->size() == weight->ne[0]) &&
+        (row_scales->empty() || (int64_t) row_scales->size() == weight->ne[1]);
+    const bool matches_transposed =
+        (col_scales->empty() || (int64_t) col_scales->size() == weight->ne[1]) &&
+        (row_scales->empty() || (int64_t) row_scales->size() == weight->ne[0]);
+
+    if (!matches_direct) {
+        if (matches_transposed) {
+            std::swap(col_scales, row_scales);
+        } else {
+            const char * name = weight_name != nullptr ? weight_name : "<unnamed>";
+            LLAMA_LOG_WARN(
+                "%s: ignoring SINQ scales for tensor '%s' due to shape mismatch (col = %zu, row = %zu, expected %lld x %lld or %lld x %lld)\n",
+                __func__, name,
+                col_scales->size(), row_scales->size(),
+                (long long) weight->ne[0], (long long) weight->ne[1],
+                (long long) weight->ne[1], (long long) weight->ne[0]);
+            return ggml_mul_mat(ctx, weight, input);
+        }
+    }
+
     ggml_tensor * scaled_input = input;
-    if (!scales->col.empty()) {
-        GGML_ASSERT((int64_t) scales->col.size() == weight->ne[0]);
-        ggml_tensor * col = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, scales->col.size());
-        std::memcpy(col->data, scales->col.data(), scales->col.size() * sizeof(float));
+    if (!col_scales->empty()) {
+        ggml_tensor * col = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, col_scales->size());
+        std::memcpy(col->data, col_scales->data(), col_scales->size() * sizeof(float));
         std::string col_name = std::string(weight_name) + ".sinq_col";
         ggml_set_name(col, col_name.c_str());
         scaled_input = ggml_mul(ctx, scaled_input, col);
@@ -391,10 +415,9 @@ ggml_tensor * llama_model::mul_mat_with_sinq(ggml_context * ctx, ggml_tensor * w
 
     ggml_tensor * result = ggml_mul_mat(ctx, weight, scaled_input);
 
-    if (!scales->row.empty()) {
-        GGML_ASSERT((int64_t) scales->row.size() == weight->ne[1]);
-        ggml_tensor * row = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, scales->row.size());
-        std::memcpy(row->data, scales->row.data(), scales->row.size() * sizeof(float));
+    if (!row_scales->empty()) {
+        ggml_tensor * row = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, row_scales->size());
+        std::memcpy(row->data, row_scales->data(), row_scales->size() * sizeof(float));
         std::string row_name = std::string(weight_name) + ".sinq_row";
         ggml_set_name(row, row_name.c_str());
         result = ggml_mul(ctx, result, row);
@@ -410,11 +433,35 @@ ggml_tensor * llama_model::mul_mat_id_with_sinq(ggml_context * ctx, ggml_tensor 
         return ggml_mul_mat_id(ctx, weight, input, ids);
     }
 
+    const std::vector<float> * col_scales = &scales->col;
+    const std::vector<float> * row_scales = &scales->row;
+
+    const bool matches_direct =
+        (col_scales->empty() || (int64_t) col_scales->size() == weight->ne[0]) &&
+        (row_scales->empty() || (int64_t) row_scales->size() == weight->ne[1]);
+    const bool matches_transposed =
+        (col_scales->empty() || (int64_t) col_scales->size() == weight->ne[1]) &&
+        (row_scales->empty() || (int64_t) row_scales->size() == weight->ne[0]);
+
+    if (!matches_direct) {
+        if (matches_transposed) {
+            std::swap(col_scales, row_scales);
+        } else {
+            const char * name = weight_name != nullptr ? weight_name : "<unnamed>";
+            LLAMA_LOG_WARN(
+                "%s: ignoring SINQ scales for tensor '%s' due to shape mismatch (col = %zu, row = %zu, expected %lld x %lld or %lld x %lld)\n",
+                __func__, name,
+                col_scales->size(), row_scales->size(),
+                (long long) weight->ne[0], (long long) weight->ne[1],
+                (long long) weight->ne[1], (long long) weight->ne[0]);
+            return ggml_mul_mat_id(ctx, weight, input, ids);
+        }
+    }
+
     ggml_tensor * scaled_input = input;
-    if (!scales->col.empty()) {
-        GGML_ASSERT((int64_t) scales->col.size() == weight->ne[0]);
-        ggml_tensor * col = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, scales->col.size());
-        std::memcpy(col->data, scales->col.data(), scales->col.size() * sizeof(float));
+    if (!col_scales->empty()) {
+        ggml_tensor * col = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, col_scales->size());
+        std::memcpy(col->data, col_scales->data(), col_scales->size() * sizeof(float));
         std::string col_name = std::string(weight_name) + ".sinq_col";
         ggml_set_name(col, col_name.c_str());
         scaled_input = ggml_mul(ctx, scaled_input, col);
@@ -422,10 +469,9 @@ ggml_tensor * llama_model::mul_mat_id_with_sinq(ggml_context * ctx, ggml_tensor 
 
     ggml_tensor * result = ggml_mul_mat_id(ctx, weight, scaled_input, ids);
 
-    if (!scales->row.empty()) {
-        GGML_ASSERT((int64_t) scales->row.size() == weight->ne[1]);
-        ggml_tensor * row = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, scales->row.size());
-        std::memcpy(row->data, scales->row.data(), scales->row.size() * sizeof(float));
+    if (!row_scales->empty()) {
+        ggml_tensor * row = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, row_scales->size());
+        std::memcpy(row->data, row_scales->data(), row_scales->size() * sizeof(float));
         std::string row_name = std::string(weight_name) + ".sinq_row";
         ggml_set_name(row, row_name.c_str());
         result = ggml_mul(ctx, result, row);
