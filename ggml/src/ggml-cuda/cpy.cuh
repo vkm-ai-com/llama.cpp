@@ -1,3 +1,5 @@
+#pragma once
+
 #include "common.cuh"
 
 #define CUDA_CPY_BLOCK_SIZE 64
