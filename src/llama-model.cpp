@@ -469,6 +469,9 @@ ggml_tensor * llama_model::mul_mat_id_with_sinq(ggml_context * ctx, ggml_tensor 
         scaled_input = ggml_mul(ctx, scaled_input, ggml_repeat(ctx, col, scaled_input));
     }
 
+    // The same ordering from Eq. (6) of the SINQ paper applies when gathering
+    // rows via ggml_mul_mat_id: scale the inputs by the column vector first,
+    // then apply the row vector to the outputs.
     ggml_tensor * result = ggml_mul_mat_id(ctx, weight, scaled_input, ids);
 
     if (!row_scales->empty()) {
