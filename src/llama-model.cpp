@@ -12,6 +12,9 @@
 #include "llama-memory-recurrent.h"
 
 #include "ggml-cpp.h"
+#if defined(GGML_USE_CUDA)
+#include "ggml-cuda.h"
+#endif
 
 #include <algorithm>
 #include <cassert>
@@ -6186,6 +6189,20 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             pimpl->sinq_by_name.emplace(tensor_name, std::move(scales));
         }
     }
+
+#if defined(GGML_USE_CUDA)
+    for (const auto & kv : pimpl->sinq_by_name) {
+        const auto * tensor = get_tensor(kv.first.c_str());
+        if (tensor == nullptr) {
+            continue;
+        }
+        const auto & scales = kv.second;
+        ggml_backend_cuda_tensor_set_sinq(
+            tensor,
+            scales.row.empty() ? nullptr : scales.row.data(), (int64_t) scales.row.size(),
+            scales.col.empty() ? nullptr : scales.col.data(), (int64_t) scales.col.size());
+    }
+#endif
 
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
