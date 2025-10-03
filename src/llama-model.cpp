@@ -410,9 +410,11 @@ ggml_tensor * llama_model::mul_mat_with_sinq(ggml_context * ctx, ggml_tensor * w
         std::memcpy(col->data, col_scales->data(), col_scales->size() * sizeof(float));
         std::string col_name = std::string(weight_name) + ".sinq_col";
         ggml_set_name(col, col_name.c_str());
-        scaled_input = ggml_mul(ctx, scaled_input, col);
+        scaled_input = ggml_mul(ctx, scaled_input, ggml_repeat(ctx, col, scaled_input));
     }
 
+    // Eq. (6) in the SINQ paper applies the column scale to the inputs and the row
+    // scale to the outputs. We mirror that ordering explicitly.
     ggml_tensor * result = ggml_mul_mat(ctx, weight, scaled_input);
 
     if (!row_scales->empty()) {
@@ -420,7 +422,7 @@ ggml_tensor * llama_model::mul_mat_with_sinq(ggml_context * ctx, ggml_tensor * w
         std::memcpy(row->data, row_scales->data(), row_scales->size() * sizeof(float));
         std::string row_name = std::string(weight_name) + ".sinq_row";
         ggml_set_name(row, row_name.c_str());
-        result = ggml_mul(ctx, result, row);
+        result = ggml_mul(ctx, result, ggml_repeat(ctx, row, result));
     }
 
     return result;
@@ -464,7 +466,7 @@ ggml_tensor * llama_model::mul_mat_id_with_sinq(ggml_context * ctx, ggml_tensor 
         std::memcpy(col->data, col_scales->data(), col_scales->size() * sizeof(float));
         std::string col_name = std::string(weight_name) + ".sinq_col";
         ggml_set_name(col, col_name.c_str());
-        scaled_input = ggml_mul(ctx, scaled_input, col);
+        scaled_input = ggml_mul(ctx, scaled_input, ggml_repeat(ctx, col, scaled_input));
     }
 
     ggml_tensor * result = ggml_mul_mat_id(ctx, weight, scaled_input, ids);
@@ -474,7 +476,7 @@ ggml_tensor * llama_model::mul_mat_id_with_sinq(ggml_context * ctx, ggml_tensor 
         std::memcpy(row->data, row_scales->data(), row_scales->size() * sizeof(float));
         std::string row_name = std::string(weight_name) + ".sinq_row";
         ggml_set_name(row, row_name.c_str());
-        result = ggml_mul(ctx, result, row);
+        result = ggml_mul(ctx, result, ggml_repeat(ctx, row, result));
     }
 
     return result;

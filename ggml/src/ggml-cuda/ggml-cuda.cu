@@ -191,7 +191,7 @@ static __global__ void sinq_scale_matrix_rows_kernel(
     }
 
     const int64_t index = row * ncols + col;
-    const float scaled = sinq_scale_to_float(data[index]) * scales[col];
+    const float scaled = sinq_scale_to_float(data[index]) * scales[row];
     data[index] = sinq_scale_from_float<T>(scaled);
 }
 
