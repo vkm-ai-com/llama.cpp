@@ -191,7 +191,10 @@ static __global__ void sinq_scale_matrix_rows_kernel(
     }
 
     const int64_t index = row * ncols + col;
-    const float scaled = sinq_scale_to_float(data[index]) * scales[col];
+    // Algorithm 1 from the SINQ paper applies the second scale vector along
+    // the output axis (rows). Each element in the row is multiplied by the
+    // corresponding row scale; reference Eq. (6) in https://arxiv.org/abs/2509.22944.
+    const float scaled = sinq_scale_to_float(data[index]) * scales[row];
     data[index] = sinq_scale_from_float<T>(scaled);
 }
 
