@@ -2368,6 +2368,21 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
 
     if (apply_sinq_row) {
+        switch (dst->type) {
+            case GGML_TYPE_F32:
+            case GGML_TYPE_F16:
+            case GGML_TYPE_BF16:
+                break;
+            default:
+                GGML_LOG_WARN(
+                    "%s: skipping SINQ row scaling for tensor '%s' with unsupported output type %s\n",
+                    __func__, tensor_name, ggml_type_name(dst->type));
+                apply_sinq_row = false;
+                break;
+        }
+    }
+
+    if (apply_sinq_row) {
         // Apply the per-output scaling after the matrix multiply, mirroring Eq. (6)
         // of the SINQ paper (https://arxiv.org/abs/2509.22944).
         float * row_dev = sinq_row_dev.alloc(ctx.pool(), sinq_row->size());
@@ -2380,7 +2395,22 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         dim3 blockDim(32, 32);
         dim3 gridDim((unsigned) ((ncols_dst + blockDim.x - 1) / blockDim.x),
                      (unsigned) ((nrows_dst + blockDim.y - 1) / blockDim.y));
-        sinq_scale_matrix_rows_kernel<<<gridDim, blockDim, 0, ctx.stream()>>>((float *) dst->data, row_dev, ncols_dst, nrows_dst);
+        switch (dst->type) {
+            case GGML_TYPE_F32:
+                sinq_scale_matrix_rows_kernel<<<gridDim, blockDim, 0, ctx.stream()>>>(
+                        static_cast<float *>(dst->data), row_dev, ncols_dst, nrows_dst);
+                break;
+            case GGML_TYPE_F16:
+                sinq_scale_matrix_rows_kernel<<<gridDim, blockDim, 0, ctx.stream()>>>(
+                        static_cast<half *>(dst->data), row_dev, ncols_dst, nrows_dst);
+                break;
+            case GGML_TYPE_BF16:
+                sinq_scale_matrix_rows_kernel<<<gridDim, blockDim, 0, ctx.stream()>>>(
+                        static_cast<nv_bfloat16 *>(dst->data), row_dev, ncols_dst, nrows_dst);
+                break;
+            default:
+                GGML_ABORT("unexpected tensor type for sinq row scaling");
+        }
         CUDA_CHECK(cudaGetLastError());
     }
 }
