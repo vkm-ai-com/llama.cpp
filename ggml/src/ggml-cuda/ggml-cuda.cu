@@ -3402,19 +3402,39 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
         }
     }
 
+#ifdef USE_CUDA_GRAPH
     if (use_cuda_graph) {
-        if (cuda_ctx->cuda_graph->instance == nullptr) { // Create executable graph from captured graph.
-            CUDA_CHECK(cudaGraphInstantiate(&cuda_ctx->cuda_graph->instance, cuda_ctx->cuda_graph->graph, NULL, NULL, 0));
+        if (cuda_ctx->cuda_graph->disable_due_to_sinq_scaling) {
+            // SINQ scaling uses temporary buffers whose lifetimes do not extend beyond
+            // the capture phase. Avoid launching the captured graph because the
+            // recorded pointers would be invalid when replayed.
+            if (cuda_ctx->cuda_graph->instance != nullptr) {
+                CUDA_CHECK(cudaGraphExecDestroy(cuda_ctx->cuda_graph->instance));
+                cuda_ctx->cuda_graph->instance = nullptr;
+            }
+            if (cuda_ctx->cuda_graph->graph != nullptr) {
+                CUDA_CHECK(cudaGraphDestroy(cuda_ctx->cuda_graph->graph));
+                cuda_ctx->cuda_graph->graph = nullptr;
+            }
+
+            cuda_ctx->cuda_graph->use_cpy_indirection = false;
+            use_cuda_graph = false;
+        } else {
+            if (cuda_ctx->cuda_graph->instance == nullptr) { // Create executable graph from captured graph.
+                CUDA_CHECK(cudaGraphInstantiate(&cuda_ctx->cuda_graph->instance, cuda_ctx->cuda_graph->graph, NULL, NULL, 0));
+            }
+            if (cuda_graph_update_required) { // Update graph executable
+                update_cuda_graph_executable(cuda_ctx);
+            }
+            // Launch graph
+            CUDA_CHECK(cudaGraphLaunch(cuda_ctx->cuda_graph->instance, cuda_ctx->stream()));
         }
-        if (cuda_graph_update_required) { // Update graph executable
-            update_cuda_graph_executable(cuda_ctx);
-        }
-        // Launch graph
-        CUDA_CHECK(cudaGraphLaunch(cuda_ctx->cuda_graph->instance, cuda_ctx->stream()));
-#else
-        graph_evaluated_or_captured = true;
-#endif  // USE_CUDA_GRAPH
     }
+#else
+    if (use_cuda_graph) {
+        graph_evaluated_or_captured = true;
+    }
+#endif  // USE_CUDA_GRAPH
 }
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
