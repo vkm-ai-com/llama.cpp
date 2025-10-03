@@ -20,8 +20,8 @@
 #include <cassert>
 #include <cmath>
 #include <cfloat>
+#include <cinttypes>
 #include <cstring>
-#include <cmath>
 #include <functional>
 #include <map>
 #include <regex>
@@ -6180,29 +6180,61 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         const std::string & tensor_name = kv.first;
         std::vector<float> row_scale;
         std::vector<float> col_scale;
-        if (ml.get_arr(tensor_name + ".sinq.row_scale", row_scale, false) &&
-            ml.get_arr(tensor_name + ".sinq.col_scale", col_scale, false)) {
-            llama_sinq_scales scales;
-            scales.row = std::move(row_scale);
-            scales.col = std::move(col_scale);
-            ml.get_key(tensor_name + ".sinq.imbalance", scales.imbalance, false);
-            pimpl->sinq_by_name.emplace(tensor_name, std::move(scales));
-        }
-    }
-
-#if defined(GGML_USE_CUDA)
-    for (const auto & kv : pimpl->sinq_by_name) {
-        const auto * tensor = get_tensor(kv.first.c_str());
-        if (tensor == nullptr) {
+        if (!ml.get_arr(tensor_name + ".sinq.row_scale", row_scale, false) ||
+            !ml.get_arr(tensor_name + ".sinq.col_scale", col_scale, false)) {
             continue;
         }
-        const auto & scales = kv.second;
+
+        llama_sinq_scales scales;
+        scales.row = std::move(row_scale);
+        scales.col = std::move(col_scale);
+        ml.get_key(tensor_name + ".sinq.imbalance", scales.imbalance, false);
+        pimpl->sinq_by_name.emplace(tensor_name, std::move(scales));
+    }
+
+    for (auto it = pimpl->sinq_by_name.begin(); it != pimpl->sinq_by_name.end(); ) {
+        const std::string & tensor_name = it->first;
+        auto & scales = it->second;
+
+        const auto * tensor = get_tensor(tensor_name.c_str());
+        if (tensor == nullptr) {
+            LLAMA_LOG_WARN("%s: unable to find tensor '%s' for SINQ scaling, disabling\n", __func__, tensor_name.c_str());
+            it = pimpl->sinq_by_name.erase(it);
+            continue;
+        }
+
+        bool has_any_scale = true;
+
+        if (!scales.col.empty() && (int64_t) scales.col.size() != tensor->ne[0]) {
+            LLAMA_LOG_WARN(
+                "%s: ignoring SINQ column scales for tensor '%s' (expected %" PRId64 ", got %zu)\n",
+                __func__, tensor_name.c_str(), tensor->ne[0], scales.col.size());
+            scales.col.clear();
+        }
+
+        if (!scales.row.empty() && (int64_t) scales.row.size() != tensor->ne[1]) {
+            LLAMA_LOG_WARN(
+                "%s: ignoring SINQ row scales for tensor '%s' (expected %" PRId64 ", got %zu)\n",
+                __func__, tensor_name.c_str(), tensor->ne[1], scales.row.size());
+            scales.row.clear();
+        }
+
+        has_any_scale = !scales.row.empty() || !scales.col.empty();
+
+        if (!has_any_scale) {
+            it = pimpl->sinq_by_name.erase(it);
+            continue;
+        }
+
+#if defined(GGML_USE_CUDA)
         ggml_backend_cuda_tensor_set_sinq(
             tensor,
             scales.row.empty() ? nullptr : scales.row.data(), (int64_t) scales.row.size(),
             scales.col.empty() ? nullptr : scales.col.data(), (int64_t) scales.col.size());
-    }
 #endif
+
+        ++it;
+    }
 
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
