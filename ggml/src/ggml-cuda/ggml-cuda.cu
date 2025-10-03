@@ -2196,14 +2196,15 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     ggml_tensor src1_sinq = *src1;
     // src1_sinq is a temporary tensor that uses a scratch buffer to hold the
     // column-scaled activations.  Any backend metadata associated with the
-    // original tensor (buffer handles, extra CUDA bookkeeping, etc.) must be
-    // cleared so subsequent CUDA helpers interact only with the explicit device
-    // pointer we manage below.  Leaving the original metadata in place can lead
-    // to helpers reading stale addresses that belong to the weight buffer
-    // instead of our scratch allocation, which prevents the kernel launches
-    // from ever executing and effectively stalls inference.
+    // original tensor (extra CUDA bookkeeping, views, etc.) must be cleared so
+    // subsequent helpers interact only with the explicit device pointer we
+    // manage below.  Leaving the original metadata in place can lead to helpers
+    // reading stale addresses that belong to the weight buffer instead of our
+    // scratch allocation, which prevents the kernel launches from ever
+    // executing and effectively stalls inference.  The buffer association is
+    // intentionally preserved so downstream helpers can keep using the original
+    // device metadata when orchestrating multi-GPU matmuls.
     src1_sinq.extra     = nullptr;
-    src1_sinq.buffer    = nullptr;
     src1_sinq.view_src  = nullptr;
     src1_sinq.view_offs = 0;
     const ggml_tensor * src1_compute = src1;
