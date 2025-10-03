@@ -404,6 +404,12 @@ struct llama_model {
     llama_hparams hparams = {};
     llama_vocab   vocab;
 
+    struct llama_sinq_scales {
+        std::vector<float> row;
+        std::vector<float> col;
+        float imbalance = 1.0f;
+    };
+
     // for classifier models
     std::vector<std::string> classifier_labels;
 
@@ -484,6 +490,14 @@ struct llama_model {
     bool has_tensor_overrides() const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
+
+    const llama_sinq_scales * get_sinq_scales(const std::string & tensor_name) const;
+    const llama_sinq_scales * get_sinq_scales(const char * tensor_name) const {
+        return get_sinq_scales(std::string(tensor_name));
+    }
+
+    ggml_tensor * mul_mat_with_sinq(ggml_context * ctx, ggml_tensor * weight, ggml_tensor * input) const;
+    ggml_tensor * mul_mat_id_with_sinq(ggml_context * ctx, ggml_tensor * weight, ggml_tensor * input, ggml_tensor * ids) const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;

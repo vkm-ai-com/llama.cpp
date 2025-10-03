@@ -15,6 +15,8 @@ struct ggml_cgraph;
 struct ggml_context;
 struct ggml_tensor;
 
+class llama_model;
+
 struct llama_cparams;
 
 struct llama_memory_context_i;
@@ -418,6 +420,8 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    const llama_model * model = nullptr;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -459,7 +463,8 @@ struct llm_graph_params {
             cvec      == other.cvec  &&
             loras     == other.loras &&
             cross     == other.cross &&
-            n_outputs == other.n_outputs;
+            n_outputs == other.n_outputs &&
+            model     == other.model;
     }
 };
 
@@ -581,6 +586,8 @@ struct llm_graph_context {
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
+
+    const llama_model * model_ptr = nullptr;
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;

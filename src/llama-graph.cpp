@@ -1,5 +1,6 @@
 #include "llama-graph.h"
 
+#include "llama-model.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
@@ -568,7 +569,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
-    gf               (res->get_gf()) {
+    gf               (res->get_gf()),
+    model_ptr        (params.model) {
         res->set_params(params);
     }
 
@@ -587,7 +589,8 @@ ggml_tensor * llm_graph_context::build_cvec(
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur) const {
-    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+    ggml_tensor * res = model_ptr ? model_ptr->mul_mat_with_sinq(ctx0, w, cur)
+                                  : ggml_mul_mat(ctx0, w, cur);
 
     for (const auto & lora : *loras) {
         llama_adapter_lora_weight * lw = lora.first->get_weight(w);
@@ -614,7 +617,8 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w,   // ggml_tensor * as
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids) const {
-    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+    ggml_tensor * res = model_ptr ? model_ptr->mul_mat_id_with_sinq(ctx0, w, cur, ids)
+                                  : ggml_mul_mat_id(ctx0, w, cur, ids);
     for (const auto & lora : *loras) {
         llama_adapter_lora_weight * lw = lora.first->get_weight(w);
         if (lw == nullptr) {

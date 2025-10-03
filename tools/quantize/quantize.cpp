@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cctype>
 #include <algorithm>
+#include <cstdlib>
 
 struct quant_option {
     std::string name;
@@ -130,6 +131,10 @@ static void usage(const char * executable) {
     printf("  --token-embedding-type ggml_type: use this ggml_type for the token embeddings tensor\n");
     printf("  --tensor-type TENSOR=TYPE: quantize this tensor to this ggml_type. example: --tensor-type attn_q=q8_0\n");
     printf("      Advanced option to selectively quantize tensors. May be specified multiple times.\n");
+    printf("  --sinq: enable Sinkhorn-Normalized Quantization preconditioning for 2D weight tensors\n");
+    printf("  --sinq-iters N: run N Sinkhorn iterations per tensor (default: %d)\n", llama_model_quantize_default_params().sinq_iterations);
+    printf("  --sinq-min-std F: clamp per-axis standard deviations to be at least F during normalization (default: %.1e)\n", llama_model_quantize_default_params().sinq_min_std);
+    printf("  --sinq-max-log-delta F: limit per-iteration log-scale updates to +-F (default: %.1f)\n", llama_model_quantize_default_params().sinq_max_log_delta);
     printf("  --prune-layers L0,L1,L2...comma-separated list of layer numbers to prune from the model\n");
     printf("      Advanced option to remove all tensors from the given layers\n");
     printf("  --keep-split: will generate quantized model in the same shards as input\n");
@@ -506,6 +511,26 @@ int main(int argc, char ** argv) {
         } else if (strcmp(argv[arg_idx], "--exclude-weights") == 0) {
             if (arg_idx < argc-1) {
                 excluded_weights.emplace_back(argv[++arg_idx]);
+            } else {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--sinq") == 0) {
+            params.use_sinq = true;
+        } else if (strcmp(argv[arg_idx], "--sinq-iters") == 0) {
+            if (arg_idx < argc-1) {
+                params.sinq_iterations = std::max(1, atoi(argv[++arg_idx]));
+            } else {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--sinq-min-std") == 0) {
+            if (arg_idx < argc-1) {
+                params.sinq_min_std = std::max(0.0f, strtof(argv[++arg_idx], nullptr));
+            } else {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--sinq-max-log-delta") == 0) {
+            if (arg_idx < argc-1) {
+                params.sinq_max_log_delta = std::max(0.0f, strtof(argv[++arg_idx], nullptr));
             } else {
                 usage(argv[0]);
             }

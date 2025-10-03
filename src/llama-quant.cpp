@@ -8,6 +8,7 @@
 #include <cstring>
 #include <cinttypes>
 #include <fstream>
+#include <limits>
 #include <mutex>
 #include <regex>
 #include <thread>
@@ -74,6 +75,176 @@ static std::string remap_imatrix (const std::string & orig_name, const std::map<
     }
 
     return orig_name;
+}
+
+static void sinq_compute_row_std(const float * data, int64_t nrows, int64_t ncols, std::vector<float> & out) {
+    out.resize(nrows);
+    for (int64_t i = 0; i < nrows; ++i) {
+        const float * row = data + i * ncols;
+        double sum = 0.0;
+        double sq  = 0.0;
+        for (int64_t j = 0; j < ncols; ++j) {
+            const double v = row[j];
+            sum += v;
+            sq  += v * v;
+        }
+        const double inv = 1.0 / std::max<int64_t>(1, ncols);
+        const double mean = sum * inv;
+        double var = sq * inv - mean * mean;
+        if (var < 0.0) {
+            var = 0.0;
+        }
+        out[i] = (float) std::sqrt(var);
+    }
+}
+
+static void sinq_compute_col_std(const float * data, int64_t nrows, int64_t ncols, std::vector<float> & out) {
+    out.resize(ncols);
+    for (int64_t j = 0; j < ncols; ++j) {
+        double sum = 0.0;
+        double sq  = 0.0;
+        for (int64_t i = 0; i < nrows; ++i) {
+            const double v = data[i * ncols + j];
+            sum += v;
+            sq  += v * v;
+        }
+        const double inv = 1.0 / std::max<int64_t>(1, nrows);
+        const double mean = sum * inv;
+        double var = sq * inv - mean * mean;
+        if (var < 0.0) {
+            var = 0.0;
+        }
+        out[j] = (float) std::sqrt(var);
+    }
+}
+
+static float sinq_min_positive(const std::vector<float> & values) {
+    float result = std::numeric_limits<float>::infinity();
+    for (float v : values) {
+        if (std::isfinite(v) && v > 0.0f) {
+            result = std::min(result, v);
+        }
+    }
+    if (!std::isfinite(result)) {
+        result = 0.0f;
+    }
+    return result;
+}
+
+static float sinq_max_finite(const std::vector<float> & values) {
+    float result = 0.0f;
+    for (float v : values) {
+        if (std::isfinite(v)) {
+            result = std::max(result, v);
+        }
+    }
+    return result;
+}
+
+static bool llama_tensor_apply_sinq(
+        const llama_model_quantize_params & params,
+        const std::string & tensor_name,
+        const float * original,
+        std::vector<float> & normalized,
+        int64_t nrows,
+        int64_t ncols,
+        std::vector<float> & row_scale,
+        std::vector<float> & col_scale,
+        float & imbalance_out) {
+
+    if (nrows <= 0 || ncols <= 0) {
+        return false;
+    }
+
+    std::vector<float> row_std_orig;
+    std::vector<float> col_std_orig;
+    sinq_compute_row_std(original, nrows, ncols, row_std_orig);
+    sinq_compute_col_std(original, nrows, ncols, col_std_orig);
+
+    float sigma_min = std::min(sinq_min_positive(row_std_orig), sinq_min_positive(col_std_orig));
+    if (!std::isfinite(sigma_min) || sigma_min <= 0.0f) {
+        sigma_min = params.sinq_min_std;
+    } else {
+        sigma_min = std::max(params.sinq_min_std, sigma_min);
+    }
+
+    std::vector<float> row_logs(nrows, 0.0f);
+    std::vector<float> col_logs(ncols, 0.0f);
+    std::vector<float> row_std;
+    std::vector<float> col_std;
+
+    for (int it = 0; it < params.sinq_iterations; ++it) {
+        sinq_compute_col_std(normalized.data(), nrows, ncols, col_std);
+        for (int64_t j = 0; j < ncols; ++j) {
+            float sigma = col_std[j];
+            if (!std::isfinite(sigma) || sigma <= 0.0f) {
+                sigma = sigma_min;
+            } else if (sigma < sigma_min) {
+                sigma = sigma_min;
+            }
+            float log_scale = std::log(std::max(sigma, std::numeric_limits<float>::min()));
+            if (params.sinq_max_log_delta > 0.0f) {
+                log_scale = std::clamp(log_scale, -params.sinq_max_log_delta, params.sinq_max_log_delta);
+                sigma = std::exp(log_scale);
+            }
+            col_logs[j] += log_scale;
+            const float inv_sigma = sigma > 0.0f ? 1.0f / sigma : 0.0f;
+            if (inv_sigma != 1.0f) {
+                for (int64_t i = 0; i < nrows; ++i) {
+                    normalized[i * ncols + j] *= inv_sigma;
+                }
+            }
+        }
+
+        sinq_compute_row_std(normalized.data(), nrows, ncols, row_std);
+        for (int64_t i = 0; i < nrows; ++i) {
+            float sigma = row_std[i];
+            if (!std::isfinite(sigma) || sigma <= 0.0f) {
+                sigma = sigma_min;
+            } else if (sigma < sigma_min) {
+                sigma = sigma_min;
+            }
+            float log_scale = std::log(std::max(sigma, std::numeric_limits<float>::min()));
+            if (params.sinq_max_log_delta > 0.0f) {
+                log_scale = std::clamp(log_scale, -params.sinq_max_log_delta, params.sinq_max_log_delta);
+                sigma = std::exp(log_scale);
+            }
+            row_logs[i] += log_scale;
+            const float inv_sigma = sigma > 0.0f ? 1.0f / sigma : 0.0f;
+            if (inv_sigma != 1.0f) {
+                float * row = normalized.data() + i * ncols;
+                for (int64_t j = 0; j < ncols; ++j) {
+                    row[j] *= inv_sigma;
+                }
+            }
+        }
+    }
+
+    sinq_compute_row_std(normalized.data(), nrows, ncols, row_std);
+    sinq_compute_col_std(normalized.data(), nrows, ncols, col_std);
+
+    float min_final = std::min(sinq_min_positive(row_std), sinq_min_positive(col_std));
+    if (!std::isfinite(min_final) || min_final <= 0.0f) {
+        min_final = sigma_min;
+    }
+    float max_final = std::max(sinq_max_finite(row_std), sinq_max_finite(col_std));
+    if (!std::isfinite(max_final) || max_final <= 0.0f) {
+        max_final = sigma_min;
+    }
+    imbalance_out = max_final / std::max(min_final, params.sinq_min_std);
+
+    row_scale.resize(nrows);
+    col_scale.resize(ncols);
+    for (int64_t i = 0; i < nrows; ++i) {
+        row_scale[i] = std::exp(row_logs[i]);
+    }
+    for (int64_t j = 0; j < ncols; ++j) {
+        col_scale[j] = std::exp(col_logs[j]);
+    }
+
+    LLAMA_LOG_DEBUG("%s: applied SINQ normalization to %s (imbalance %.5f)\n", __func__, tensor_name.c_str(), imbalance_out);
+
+    return true;
 }
 
 struct quantize_state_impl {
@@ -991,10 +1162,32 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             const int64_t nchunk = (nelements_matrix + chunk_size - 1)/chunk_size;
             const int64_t nthread_use = nthread > 1 ? std::max((int64_t)1, std::min((int64_t)nthread, nchunk)) : 1;
 
+            bool sinq_applied = false;
+            float sinq_imbalance = 0.0f;
+            std::vector<float> sinq_buffer;
+            std::vector<float> sinq_row_scale;
+            std::vector<float> sinq_col_scale;
+
+            if (params->use_sinq && ggml_n_dims(tensor) == 2 && tensor->ne[2] == 1 && tensor->ne[3] == 1 && nrows > 1 && n_per_row > 1) {
+                try {
+                    sinq_buffer.assign(f32_data, f32_data + nelements_matrix);
+                    sinq_applied = llama_tensor_apply_sinq(*params, name, f32_data, sinq_buffer, nrows, n_per_row, sinq_row_scale, sinq_col_scale, sinq_imbalance);
+                } catch (const std::exception & e) {
+                    LLAMA_LOG_WARN("%s: failed SINQ normalization for %s: %s\n", __func__, name.c_str(), e.what());
+                    sinq_applied = false;
+                    sinq_buffer.clear();
+                    sinq_row_scale.clear();
+                    sinq_col_scale.clear();
+                }
+            }
+
             // quantize each expert separately since they have different importance matrices
             new_size = 0;
             for (int64_t i03 = 0; i03 < tensor->ne[2]; ++i03) {
                 const float * f32_data_03 = f32_data + i03 * nelements_matrix;
+                if (sinq_applied && i03 == 0) {
+                    f32_data_03 = sinq_buffer.data();
+                }
                 void * new_data_03 = (char *)new_data + ggml_row_size(new_type, n_per_row) * i03 * nrows;
                 const float * imatrix_03 = imatrix ? imatrix + i03 * n_per_row : nullptr;
 
@@ -1024,6 +1217,14 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 #endif
             }
             LLAMA_LOG_INFO("size = %8.2f MiB -> %8.2f MiB\n", ggml_nbytes(tensor)/1024.0/1024.0, new_size/1024.0/1024.0);
+
+            if (sinq_applied) {
+                const std::string row_key = name + ".sinq.row_scale";
+                const std::string col_key = name + ".sinq.col_scale";
+                gguf_set_arr_data(ctx_outs[cur_split].get(), row_key.c_str(), GGUF_TYPE_FLOAT32, sinq_row_scale.data(), sinq_row_scale.size());
+                gguf_set_arr_data(ctx_outs[cur_split].get(), col_key.c_str(), GGUF_TYPE_FLOAT32, sinq_col_scale.data(), sinq_col_scale.size());
+                gguf_set_val_f32(ctx_outs[cur_split].get(), (name + ".sinq.imbalance").c_str(), sinq_imbalance);
+            }
         }
         total_size_org += ggml_nbytes(tensor);
         total_size_new += new_size;
@@ -1063,6 +1264,10 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.only_copy                   =*/ false,
         /*.pure                        =*/ false,
         /*.keep_split                  =*/ false,
+        /*.use_sinq                    =*/ false,
+        /*.sinq_iterations             =*/ 6,
+        /*.sinq_min_std                =*/ 1e-6f,
+        /*.sinq_max_log_delta          =*/ 2.0f,
         /*.imatrix                     =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
         /*.tensor_type                 =*/ nullptr,
