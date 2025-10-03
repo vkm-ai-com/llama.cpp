@@ -2104,8 +2104,43 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
 
     const ggml_cuda_sinq_scales * sinq_scales = ggml_cuda_get_sinq_scales(src0);
-    const bool apply_sinq_col = sinq_scales != nullptr && !sinq_scales->col.empty();
-    const bool apply_sinq_row = sinq_scales != nullptr && !sinq_scales->row.empty();
+    const std::vector<float> * sinq_col = nullptr;
+    const std::vector<float> * sinq_row = nullptr;
+
+    if (sinq_scales != nullptr) {
+        const bool matches_direct =
+            (sinq_scales->col.empty() || (int64_t) sinq_scales->col.size() == src0->ne[0]) &&
+            (sinq_scales->row.empty() || (int64_t) sinq_scales->row.size() == src0->ne[1]);
+        const bool matches_transposed =
+            (sinq_scales->col.empty() || (int64_t) sinq_scales->col.size() == src0->ne[1]) &&
+            (sinq_scales->row.empty() || (int64_t) sinq_scales->row.size() == src0->ne[0]);
+
+        if (matches_direct) {
+            if (!sinq_scales->col.empty()) {
+                sinq_col = &sinq_scales->col;
+            }
+            if (!sinq_scales->row.empty()) {
+                sinq_row = &sinq_scales->row;
+            }
+        } else if (matches_transposed) {
+            if (!sinq_scales->row.empty()) {
+                sinq_col = &sinq_scales->row;
+            }
+            if (!sinq_scales->col.empty()) {
+                sinq_row = &sinq_scales->col;
+            }
+        } else if (!sinq_scales->col.empty() || !sinq_scales->row.empty()) {
+            GGML_LOG_WARN(
+                "%s: ignoring SINQ scales for tensor '%s' due to shape mismatch (col = %zu, row = %zu, expected %lld x %lld or %lld x %lld)\n",
+                __func__, src0->name ? src0->name : "unnamed",
+                sinq_scales->col.size(), sinq_scales->row.size(),
+                (long long) src0->ne[0], (long long) src0->ne[1],
+                (long long) src0->ne[1], (long long) src0->ne[0]);
+        }
+    }
+
+    const bool apply_sinq_col = sinq_col != nullptr;
+    const bool apply_sinq_row = sinq_row != nullptr;
 
     ggml_tensor src1_sinq = *src1;
     const ggml_tensor * src1_compute = src1;
@@ -2113,7 +2148,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     ggml_cuda_pool_alloc<float> sinq_row_dev;
 
     if (apply_sinq_col) {
-        GGML_ASSERT((int64_t) sinq_scales->col.size() == src0->ne[0]);
+        GGML_ASSERT((int64_t) sinq_col->size() == src0->ne[0]);
 
         const int64_t nelements_src1 = ggml_nelements(src1);
 
@@ -2145,9 +2180,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
         ggml_cuda_cpy(ctx, src1, &src1_sinq);
 
-        float * col_dev = sinq_col_dev.alloc(ctx.pool(), sinq_scales->col.size());
-        CUDA_CHECK(cudaMemcpyAsync(col_dev, sinq_scales->col.data(),
-                                   sinq_scales->col.size()*sizeof(float),
+        float * col_dev = sinq_col_dev.alloc(ctx.pool(), sinq_col->size());
+        CUDA_CHECK(cudaMemcpyAsync(col_dev, sinq_col->data(),
+                                   sinq_col->size()*sizeof(float),
                                    cudaMemcpyHostToDevice, ctx.stream()));
 
         const int64_t ncols = src1->ne[0];
@@ -2258,11 +2293,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     if (apply_sinq_row) {
         GGML_ASSERT(dst->type == GGML_TYPE_F32);
-        GGML_ASSERT((int64_t) sinq_scales->row.size() == src0->ne[1]);
+        GGML_ASSERT((int64_t) sinq_row->size() == src0->ne[1]);
 
-        float * row_dev = sinq_row_dev.alloc(ctx.pool(), sinq_scales->row.size());
-        CUDA_CHECK(cudaMemcpyAsync(row_dev, sinq_scales->row.data(),
-                                   sinq_scales->row.size()*sizeof(float),
+        float * row_dev = sinq_row_dev.alloc(ctx.pool(), sinq_row->size());
+        CUDA_CHECK(cudaMemcpyAsync(row_dev, sinq_row->data(),
+                                   sinq_row->size()*sizeof(float),
                                    cudaMemcpyHostToDevice, ctx.stream()));
 
         const int64_t ncols_dst = dst->ne[0];
