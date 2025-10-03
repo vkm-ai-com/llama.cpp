@@ -2185,6 +2185,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         }
     }
 
+    if (apply_sinq_col || apply_sinq_row) {
+#ifdef USE_CUDA_GRAPH
+        if (ctx.cuda_graph != nullptr) {
+            ctx.cuda_graph->disable_due_to_sinq_scaling = true;
+        }
+#endif
+    }
+
     ggml_tensor src1_sinq = *src1;
     // src1_sinq is a temporary tensor that borrows the buffer from src1 but
     // stores its own device pointer (src1_tmp).  The ggml_tensor_extra_gpu
@@ -3399,7 +3407,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (disable_cuda_graphs_due_to_env
         || cuda_ctx->cuda_graph->disable_due_to_gpu_arch
         || cuda_ctx->cuda_graph->disable_due_to_too_many_updates
-        || cuda_ctx->cuda_graph->disable_due_to_failed_graph_capture) {
+        || cuda_ctx->cuda_graph->disable_due_to_failed_graph_capture
+        || cuda_ctx->cuda_graph->disable_due_to_sinq_scaling) {
         use_cuda_graph = false;
     }
 
