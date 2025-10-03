@@ -132,6 +132,36 @@ static const ggml_cuda_sinq_scales * ggml_cuda_get_sinq_scales(const ggml_tensor
 }
 
 template <typename T>
+static __device__ inline float sinq_scale_to_float(T value) {
+    return value;
+}
+
+template <>
+__device__ inline float sinq_scale_to_float(half value) {
+    return __half2float(value);
+}
+
+template <>
+__device__ inline float sinq_scale_to_float(nv_bfloat16 value) {
+    return __bfloat162float(value);
+}
+
+template <typename T>
+static __device__ inline T sinq_scale_from_float(float value) {
+    return value;
+}
+
+template <>
+__device__ inline half sinq_scale_from_float(float value) {
+    return __float2half(value);
+}
+
+template <>
+__device__ inline nv_bfloat16 sinq_scale_from_float(float value) {
+    return __float2bfloat16(value);
+}
+
+template <typename T>
 static __global__ void sinq_scale_matrix_kernel(
         T * data,
         const float * scales,
@@ -144,7 +174,8 @@ static __global__ void sinq_scale_matrix_kernel(
     }
 
     const int64_t index = row * ncols + col;
-    data[index] *= scales[col];
+    const float scaled = sinq_scale_to_float(data[index]) * scales[col];
+    data[index] = sinq_scale_from_float<T>(scaled);
 }
 
 [[noreturn]]
@@ -2080,14 +2111,30 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const ggml_tensor * src1_compute = src1;
     ggml_cuda_pool_alloc<float> sinq_col_dev;
     ggml_cuda_pool_alloc<float> sinq_row_dev;
-    ggml_cuda_pool_alloc<float> sinq_src1_dev;
 
     if (apply_sinq_col) {
-        GGML_ASSERT(src1->type == GGML_TYPE_F32);
         GGML_ASSERT((int64_t) sinq_scales->col.size() == src0->ne[0]);
 
         const int64_t nelements_src1 = ggml_nelements(src1);
-        float * src1_tmp = sinq_src1_dev.alloc(ctx.pool(), nelements_src1);
+
+        void * src1_tmp = nullptr;
+        ggml_cuda_pool_alloc<float>        sinq_src1_dev_f32;
+        ggml_cuda_pool_alloc<half>         sinq_src1_dev_f16;
+        ggml_cuda_pool_alloc<nv_bfloat16>  sinq_src1_dev_bf16;
+
+        switch (src1->type) {
+            case GGML_TYPE_F32:
+                src1_tmp = sinq_src1_dev_f32.alloc(ctx.pool(), nelements_src1);
+                break;
+            case GGML_TYPE_F16:
+                src1_tmp = sinq_src1_dev_f16.alloc(ctx.pool(), nelements_src1);
+                break;
+            case GGML_TYPE_BF16:
+                src1_tmp = sinq_src1_dev_bf16.alloc(ctx.pool(), nelements_src1);
+                break;
+            default:
+                GGML_ABORT("unsupported tensor type for sinq column scaling");
+        }
 
         src1_sinq.buffer = src1->buffer;
         src1_sinq.data   = src1_tmp;
@@ -2108,7 +2155,22 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         dim3 blockDim(32, 32);
         dim3 gridDim((unsigned) ((ncols + blockDim.x - 1) / blockDim.x),
                      (unsigned) ((nrows + blockDim.y - 1) / blockDim.y));
-        sinq_scale_matrix_kernel<<<gridDim, blockDim, 0, ctx.stream()>>>(src1_tmp, col_dev, ncols, nrows);
+        switch (src1->type) {
+            case GGML_TYPE_F32:
+                sinq_scale_matrix_kernel<<<gridDim, blockDim, 0, ctx.stream()>>>(
+                        static_cast<float *>(src1_tmp), col_dev, ncols, nrows);
+                break;
+            case GGML_TYPE_F16:
+                sinq_scale_matrix_kernel<<<gridDim, blockDim, 0, ctx.stream()>>>(
+                        static_cast<half *>(src1_tmp), col_dev, ncols, nrows);
+                break;
+            case GGML_TYPE_BF16:
+                sinq_scale_matrix_kernel<<<gridDim, blockDim, 0, ctx.stream()>>>(
+                        static_cast<nv_bfloat16 *>(src1_tmp), col_dev, ncols, nrows);
+                break;
+            default:
+                GGML_ABORT("unsupported tensor type for sinq column scaling");
+        }
 
         src1_compute = &src1_sinq;
     }
