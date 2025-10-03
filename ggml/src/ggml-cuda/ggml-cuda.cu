@@ -2193,27 +2193,40 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 #endif
     }
 
-    ggml_tensor src1_sinq = *src1;
-    // src1_sinq is a temporary tensor that uses a scratch buffer to hold the
-    // column-scaled activations.  Any backend metadata associated with the
-    // original tensor (buffer handles, extra CUDA bookkeeping, graph links,
-    // etc.) must be cleared so subsequent CUDA helpers interact only with the
-    // explicit device pointer we manage below.  Leaving the original metadata
-    // in place can lead to helpers reading stale addresses that belong to the
-    // weight buffer instead of our scratch allocation, which prevents the kernel
-    // launches from ever executing and effectively stalls inference.
-    src1_sinq.extra     = nullptr;
-    // keep the original backend buffer (intentionally not cleared) so
-    // downstream CUDA helpers can inspect the tensor's device placement.
-    // only the data pointer is redirected to the temporary scratch
-    // allocation below.
-    src1_sinq.view_src  = nullptr;
-    src1_sinq.view_offs = 0;
-    src1_sinq.op        = GGML_OP_NONE;
-    src1_sinq.flags     = 0;
-    for (auto & src_entry : src1_sinq.src) {
-        src_entry = nullptr;
-    }
+    struct tensor_data_guard {
+        ggml_tensor * tensor = nullptr;
+        void * original_data = nullptr;
+        std::array<size_t, GGML_MAX_DIMS> original_nb{};
+        bool active = false;
+
+        ~tensor_data_guard() {
+            restore();
+        }
+
+        void capture(ggml_tensor * t) {
+            tensor = t;
+            original_data = t->data;
+            for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+                original_nb[i] = t->nb[i];
+            }
+            active = true;
+        }
+
+        void restore() {
+            if (!active || tensor == nullptr) {
+                return;
+            }
+
+            tensor->data = original_data;
+            for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+                tensor->nb[i] = original_nb[i];
+            }
+
+            active = false;
+        }
+    };
+
+    tensor_data_guard src1_guard;
     const ggml_tensor * src1_compute = src1;
     ggml_cuda_pool_alloc<float>       sinq_col_dev;
     ggml_cuda_pool_alloc<float>       sinq_row_dev;
@@ -2243,18 +2256,32 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         }
 
         if (apply_sinq_col) {
-            src1_sinq.data   = src1_tmp;
-            src1_sinq.nb[0]  = ggml_type_size(src1_sinq.type);
-            src1_sinq.nb[1]  = src1_sinq.nb[0] * src1_sinq.ne[0];
-            src1_sinq.nb[2]  = src1_sinq.nb[1] * src1_sinq.ne[1];
-            src1_sinq.nb[3]  = src1_sinq.nb[2] * src1_sinq.ne[2];
+            ggml_tensor src1_tmp_tensor = *src1;
+            // src1_tmp_tensor is only used for the temporary copy that holds the
+            // column-scaled activations.  Clear any backend-specific metadata so
+            // helpers interact exclusively with the explicit scratch pointer we
+            // manage here.
+            src1_tmp_tensor.extra     = nullptr;
+            src1_tmp_tensor.view_src  = nullptr;
+            src1_tmp_tensor.view_offs = 0;
+            src1_tmp_tensor.op        = GGML_OP_NONE;
+            src1_tmp_tensor.flags     = 0;
+            for (auto & src_entry : src1_tmp_tensor.src) {
+                src_entry = nullptr;
+            }
+
+            src1_tmp_tensor.data   = src1_tmp;
+            src1_tmp_tensor.nb[0]  = ggml_type_size(src1_tmp_tensor.type);
+            src1_tmp_tensor.nb[1]  = src1_tmp_tensor.nb[0] * src1_tmp_tensor.ne[0];
+            src1_tmp_tensor.nb[2]  = src1_tmp_tensor.nb[1] * src1_tmp_tensor.ne[1];
+            src1_tmp_tensor.nb[3]  = src1_tmp_tensor.nb[2] * src1_tmp_tensor.ne[2];
 
             // Disable copy indirection here because this temporary tensor is not a
             // persistent graph node.  Otherwise CUDA graph capture would assume an
             // extra GGML_OP_CPY node, leading to pointer indirection bookkeeping
             // mismatches the next time the graph is replayed (e.g. during the
             // server warmup decode), effectively stalling execution.
-            ggml_cuda_cpy(ctx, src1, &src1_sinq, /*disable_indirection_for_this_node=*/true);
+            ggml_cuda_cpy(ctx, src1, &src1_tmp_tensor, /*disable_indirection_for_this_node=*/true);
 
             float * col_dev = sinq_col_dev.alloc(ctx.pool(), sinq_col->size());
             CUDA_CHECK(cudaMemcpyAsync(col_dev, sinq_col->data(),
@@ -2269,15 +2296,15 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             switch (src1->type) {
                 case GGML_TYPE_F32:
                     sinq_scale_matrix_cols_kernel<<<gridDim, blockDim, 0, ctx.stream()>>>(
-                            static_cast<float *>(src1_tmp), col_dev, ncols, nrows);
+                            static_cast<float *>(src1_tmp_tensor.data), col_dev, ncols, nrows);
                     break;
                 case GGML_TYPE_F16:
                     sinq_scale_matrix_cols_kernel<<<gridDim, blockDim, 0, ctx.stream()>>>(
-                            static_cast<half *>(src1_tmp), col_dev, ncols, nrows);
+                            static_cast<half *>(src1_tmp_tensor.data), col_dev, ncols, nrows);
                     break;
                 case GGML_TYPE_BF16:
                     sinq_scale_matrix_cols_kernel<<<gridDim, blockDim, 0, ctx.stream()>>>(
-                            static_cast<nv_bfloat16 *>(src1_tmp), col_dev, ncols, nrows);
+                            static_cast<nv_bfloat16 *>(src1_tmp_tensor.data), col_dev, ncols, nrows);
                     break;
                 default:
                     // This should not happen because unsupported types disable the scaling above.
@@ -2285,7 +2312,15 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             }
             CUDA_CHECK(cudaGetLastError());
 
-            src1_compute = &src1_sinq;
+            ggml_tensor * src1_mut = const_cast<ggml_tensor *>(src1);
+            src1_guard.capture(src1_mut);
+            src1_mut->data = src1_tmp_tensor.data;
+            src1_mut->nb[0] = src1_tmp_tensor.nb[0];
+            src1_mut->nb[1] = src1_tmp_tensor.nb[1];
+            src1_mut->nb[2] = src1_tmp_tensor.nb[2];
+            src1_mut->nb[3] = src1_tmp_tensor.nb[3];
+
+            src1_compute = src1;
         }
     }
 
