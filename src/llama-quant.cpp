@@ -945,6 +945,36 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         }
     }
 
+    // Reserve metadata space for SINQ scales before writing tensor data. This keeps the
+    // placeholder header large enough even after we add the SINQ arrays later.
+    if (params->use_sinq) {
+        for (const auto * it : tensors) {
+            const ggml_tensor * tensor = it->tensor;
+            const bool maybe_sinq = ggml_n_dims(tensor) == 2 && tensor->ne[2] == 1 && tensor->ne[3] == 1 &&
+                                    tensor->ne[0] > 1 && tensor->ne[1] > 1;
+            if (!maybe_sinq) {
+                continue;
+            }
+
+            const std::string name = ggml_get_name(tensor);
+            const std::string row_key = name + ".sinq.row_scale";
+            const std::string col_key = name + ".sinq.col_scale";
+            const std::string imb_key = name + ".sinq.imbalance";
+
+            std::vector<float> row_placeholder(tensor->ne[1], 0.0f);
+            std::vector<float> col_placeholder(tensor->ne[0], 0.0f);
+
+            uint16_t i_split = params->keep_split ? it->idx : 0;
+            GGML_ASSERT(ctx_outs[i_split] && "Find uninitialized gguf_context");
+
+            gguf_set_arr_data(ctx_outs[i_split].get(), row_key.c_str(), GGUF_TYPE_FLOAT32,
+                    row_placeholder.data(), row_placeholder.size());
+            gguf_set_arr_data(ctx_outs[i_split].get(), col_key.c_str(), GGUF_TYPE_FLOAT32,
+                    col_placeholder.data(), col_placeholder.size());
+            gguf_set_val_f32(ctx_outs[i_split].get(), imb_key.c_str(), 1.0f);
+        }
+    }
+
     int cur_split = -1;
     std::ofstream fout;
     auto close_ofstream = [&]() {
@@ -1089,6 +1119,15 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             quantize = tensor->type != new_type;
         }
 
+        const int64_t n_per_row = tensor->ne[0];
+        const int64_t nrows = tensor->ne[1];
+
+        const bool maybe_sinq = params->use_sinq && ggml_n_dims(tensor) == 2 && tensor->ne[2] == 1 && tensor->ne[3] == 1 &&
+                                nrows > 1 && n_per_row > 1;
+
+        bool sinq_applied = false;
+        float sinq_imbalance = 0.0f;
+
         if (!quantize) {
             new_type = tensor->type;
             new_data = tensor->data;
@@ -1152,9 +1191,6 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             }
             new_data = work.data();
 
-            const int64_t n_per_row = tensor->ne[0];
-            const int64_t nrows = tensor->ne[1];
-
             static const int64_t min_chunk_size = 32 * 512;
             const int64_t chunk_size = (n_per_row >= min_chunk_size ? n_per_row : n_per_row * ((min_chunk_size + n_per_row - 1)/n_per_row));
 
@@ -1162,13 +1198,11 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             const int64_t nchunk = (nelements_matrix + chunk_size - 1)/chunk_size;
             const int64_t nthread_use = nthread > 1 ? std::max((int64_t)1, std::min((int64_t)nthread, nchunk)) : 1;
 
-            bool sinq_applied = false;
-            float sinq_imbalance = 0.0f;
             std::vector<float> sinq_buffer;
             std::vector<float> sinq_row_scale;
             std::vector<float> sinq_col_scale;
 
-            if (params->use_sinq && ggml_n_dims(tensor) == 2 && tensor->ne[2] == 1 && tensor->ne[3] == 1 && nrows > 1 && n_per_row > 1) {
+            if (maybe_sinq) {
                 try {
                     sinq_buffer.assign(f32_data, f32_data + nelements_matrix);
                     sinq_applied = llama_tensor_apply_sinq(*params, name, f32_data, sinq_buffer, nrows, n_per_row, sinq_row_scale, sinq_col_scale, sinq_imbalance);
@@ -1225,6 +1259,15 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 gguf_set_arr_data(ctx_outs[cur_split].get(), col_key.c_str(), GGUF_TYPE_FLOAT32, sinq_col_scale.data(), sinq_col_scale.size());
                 gguf_set_val_f32(ctx_outs[cur_split].get(), (name + ".sinq.imbalance").c_str(), sinq_imbalance);
             }
+        }
+
+        if (!sinq_applied && maybe_sinq) {
+            const std::string row_key = name + ".sinq.row_scale";
+            const std::string col_key = name + ".sinq.col_scale";
+            const std::string imb_key = name + ".sinq.imbalance";
+            gguf_remove_key(ctx_outs[cur_split].get(), row_key.c_str());
+            gguf_remove_key(ctx_outs[cur_split].get(), col_key.c_str());
+            gguf_remove_key(ctx_outs[cur_split].get(), imb_key.c_str());
         }
         total_size_org += ggml_nbytes(tensor);
         total_size_new += new_size;
