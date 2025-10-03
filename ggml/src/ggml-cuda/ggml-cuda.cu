@@ -53,9 +53,9 @@
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
+#include <algorithm>
 #include "ggml.h"
 
-#include <algorithm>
 #include <array>
 #include <atomic>
 #include <charconv>
@@ -2210,6 +2210,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     src1_sinq.view_src  = nullptr;
     src1_sinq.view_offs = 0;
     src1_sinq.op        = GGML_OP_NONE;
+    std::fill(std::begin(src1_sinq.op_params), std::end(src1_sinq.op_params), 0);
     src1_sinq.flags     = 0;
     for (auto & src_entry : src1_sinq.src) {
         src_entry = nullptr;
