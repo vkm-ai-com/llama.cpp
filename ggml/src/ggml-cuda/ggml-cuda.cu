@@ -2186,14 +2186,18 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
 
     ggml_tensor src1_sinq = *src1;
-    // src1_sinq is a temporary tensor that borrows the buffer from src1 but
-    // stores its own device pointer (src1_tmp).  The ggml_tensor_extra_gpu
-    // metadata stored in ->extra points to the original allocation, which is
-    // not valid for this temporary view.  Reset the pointer so CUDA kernels do
-    // not accidentally use the stale metadata (this previously caused crashes
-    // when the backend attempted to operate on the wrong device address after
-    // SINQ scaling was enabled).
-    src1_sinq.extra = nullptr;
+    // src1_sinq is a temporary tensor that uses a scratch buffer to hold the
+    // column-scaled activations.  Any backend metadata associated with the
+    // original tensor (buffer handles, extra CUDA bookkeeping, etc.) must be
+    // cleared so subsequent CUDA helpers interact only with the explicit device
+    // pointer we manage below.  Leaving the original metadata in place can lead
+    // to helpers reading stale addresses that belong to the weight buffer
+    // instead of our scratch allocation, which prevents the kernel launches
+    // from ever executing and effectively stalls inference.
+    src1_sinq.extra     = nullptr;
+    src1_sinq.buffer    = nullptr;
+    src1_sinq.view_src  = nullptr;
+    src1_sinq.view_offs = 0;
     const ggml_tensor * src1_compute = src1;
     ggml_cuda_pool_alloc<float>       sinq_col_dev;
     ggml_cuda_pool_alloc<float>       sinq_row_dev;
@@ -2223,50 +2227,49 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         }
 
         if (apply_sinq_col) {
-        src1_sinq.buffer = src1->buffer;
-        src1_sinq.data   = src1_tmp;
-        src1_sinq.nb[0]  = ggml_type_size(src1_sinq.type);
-        src1_sinq.nb[1]  = src1_sinq.nb[0] * src1_sinq.ne[0];
-        src1_sinq.nb[2]  = src1_sinq.nb[1] * src1_sinq.ne[1];
-        src1_sinq.nb[3]  = src1_sinq.nb[2] * src1_sinq.ne[2];
+            src1_sinq.data   = src1_tmp;
+            src1_sinq.nb[0]  = ggml_type_size(src1_sinq.type);
+            src1_sinq.nb[1]  = src1_sinq.nb[0] * src1_sinq.ne[0];
+            src1_sinq.nb[2]  = src1_sinq.nb[1] * src1_sinq.ne[1];
+            src1_sinq.nb[3]  = src1_sinq.nb[2] * src1_sinq.ne[2];
 
-        // Disable copy indirection here because this temporary tensor is not a
-        // persistent graph node.  Otherwise CUDA graph capture would assume an
-        // extra GGML_OP_CPY node, leading to pointer indirection bookkeeping
-        // mismatches the next time the graph is replayed (e.g. during the
-        // server warmup decode), effectively stalling execution.
-        ggml_cuda_cpy(ctx, src1, &src1_sinq, /*disable_indirection_for_this_node=*/true);
+            // Disable copy indirection here because this temporary tensor is not a
+            // persistent graph node.  Otherwise CUDA graph capture would assume an
+            // extra GGML_OP_CPY node, leading to pointer indirection bookkeeping
+            // mismatches the next time the graph is replayed (e.g. during the
+            // server warmup decode), effectively stalling execution.
+            ggml_cuda_cpy(ctx, src1, &src1_sinq, /*disable_indirection_for_this_node=*/true);
 
-        float * col_dev = sinq_col_dev.alloc(ctx.pool(), sinq_col->size());
-        CUDA_CHECK(cudaMemcpyAsync(col_dev, sinq_col->data(),
-                                   sinq_col->size()*sizeof(float),
-                                   cudaMemcpyHostToDevice, ctx.stream()));
+            float * col_dev = sinq_col_dev.alloc(ctx.pool(), sinq_col->size());
+            CUDA_CHECK(cudaMemcpyAsync(col_dev, sinq_col->data(),
+                                       sinq_col->size()*sizeof(float),
+                                       cudaMemcpyHostToDevice, ctx.stream()));
 
-        const int64_t ncols = src1->ne[0];
-        const int64_t nrows = ggml_nrows(src1);
-        dim3 blockDim(32, 32);
-        dim3 gridDim((unsigned) ((ncols + blockDim.x - 1) / blockDim.x),
-                     (unsigned) ((nrows + blockDim.y - 1) / blockDim.y));
-        switch (src1->type) {
-            case GGML_TYPE_F32:
-                sinq_scale_matrix_cols_kernel<<<gridDim, blockDim, 0, ctx.stream()>>>(
-                        static_cast<float *>(src1_tmp), col_dev, ncols, nrows);
-                break;
-            case GGML_TYPE_F16:
-                sinq_scale_matrix_cols_kernel<<<gridDim, blockDim, 0, ctx.stream()>>>(
-                        static_cast<half *>(src1_tmp), col_dev, ncols, nrows);
-                break;
-            case GGML_TYPE_BF16:
-                sinq_scale_matrix_cols_kernel<<<gridDim, blockDim, 0, ctx.stream()>>>(
-                        static_cast<nv_bfloat16 *>(src1_tmp), col_dev, ncols, nrows);
-                break;
-            default:
-                // This should not happen because unsupported types disable the scaling above.
-                GGML_ABORT("unexpected tensor type for sinq column scaling");
-        }
-        CUDA_CHECK(cudaGetLastError());
+            const int64_t ncols = src1->ne[0];
+            const int64_t nrows = ggml_nrows(src1);
+            dim3 blockDim(32, 32);
+            dim3 gridDim((unsigned) ((ncols + blockDim.x - 1) / blockDim.x),
+                         (unsigned) ((nrows + blockDim.y - 1) / blockDim.y));
+            switch (src1->type) {
+                case GGML_TYPE_F32:
+                    sinq_scale_matrix_cols_kernel<<<gridDim, blockDim, 0, ctx.stream()>>>(
+                            static_cast<float *>(src1_tmp), col_dev, ncols, nrows);
+                    break;
+                case GGML_TYPE_F16:
+                    sinq_scale_matrix_cols_kernel<<<gridDim, blockDim, 0, ctx.stream()>>>(
+                            static_cast<half *>(src1_tmp), col_dev, ncols, nrows);
+                    break;
+                case GGML_TYPE_BF16:
+                    sinq_scale_matrix_cols_kernel<<<gridDim, blockDim, 0, ctx.stream()>>>(
+                            static_cast<nv_bfloat16 *>(src1_tmp), col_dev, ncols, nrows);
+                    break;
+                default:
+                    // This should not happen because unsupported types disable the scaling above.
+                    GGML_ABORT("unexpected tensor type for sinq column scaling");
+            }
+            CUDA_CHECK(cudaGetLastError());
 
-        src1_compute = &src1_sinq;
+            src1_compute = &src1_sinq;
         }
     }
 
