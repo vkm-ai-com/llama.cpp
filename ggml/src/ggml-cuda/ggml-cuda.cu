@@ -2163,6 +2163,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const bool apply_sinq_row = sinq_row != nullptr;
 
     ggml_tensor src1_sinq = *src1;
+    // src1_sinq is a temporary tensor that borrows the buffer from src1 but
+    // stores its own device pointer (src1_tmp).  The ggml_tensor_extra_gpu
+    // metadata stored in ->extra points to the original allocation, which is
+    // not valid for this temporary view.  Reset the pointer so CUDA kernels do
+    // not accidentally use the stale metadata (this previously caused crashes
+    // when the backend attempted to operate on the wrong device address after
+    // SINQ scaling was enabled).
+    src1_sinq.extra = nullptr;
     const ggml_tensor * src1_compute = src1;
     ggml_cuda_pool_alloc<float> sinq_col_dev;
     ggml_cuda_pool_alloc<float> sinq_row_dev;
