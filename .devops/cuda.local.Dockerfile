@@ -48,7 +48,7 @@ RUN --mount=type=cache,target=/root/.cache/ccache,sharing=locked \
     cp .devops/tools.sh /app/full/tools.sh
 
 ## Base image
-FROM ${BASE_CUDA_RUN_CONTAINER} AS base
+FROM ${BASE_CUDA_RUN_CONTAINER} AS runtime_base
 
 RUN --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     --mount=type=cache,target=/var/cache/apt,sharing=locked \
@@ -61,15 +61,12 @@ RUN --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     && find /var/cache/apt/archives /var/lib/apt/lists -not -name lock -type f -delete \
     && find /var/cache -type f -delete
 
-COPY --from=build /app/lib/ /app
+FROM runtime_base AS python_env
 
-### Full
-FROM base AS full
+WORKDIR /tmp/pip
 
-WORKDIR /app
-
-COPY requirements.txt /app/requirements.txt
-COPY requirements /app/requirements
+COPY requirements.txt ./requirements.txt
+COPY requirements ./requirements
 
 RUN --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     --mount=type=cache,target=/var/cache/apt,sharing=locked \
@@ -80,14 +77,25 @@ RUN --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     git \
     python3 \
     python3-pip \
-    && pip install --upgrade pip setuptools wheel \
-    && pip install --break-system-packages -r requirements.txt \
+    && python3 -m pip install --upgrade pip setuptools wheel \
+    && python3 -m pip install --break-system-packages -r requirements.txt \
     && apt autoremove -y \
     && apt clean -y \
     && rm -rf /tmp/* /var/tmp/* \
     && find /var/cache/apt/archives /var/lib/apt/lists -not -name lock -type f -delete \
-    && find /var/cache -type f -delete
+    && find /var/cache -type f -delete \
+    && rm -rf /tmp/pip
 
+FROM runtime_base AS base
+
+COPY --from=build /app/lib/ /app
+
+### Full
+FROM python_env AS full
+
+WORKDIR /app
+
+COPY --from=build /app/lib/ /app
 COPY --from=build /app/full /app
 
 
