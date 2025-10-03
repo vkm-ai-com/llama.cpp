@@ -12,6 +12,9 @@
 #include "llama-memory-recurrent.h"
 
 #include "ggml-cpp.h"
+#if defined(GGML_USE_CUDA)
+#include "ggml-cuda.h"
+#endif
 
 #include <algorithm>
 #include <cassert>
@@ -369,6 +372,68 @@ static buft_list_t make_cpu_buft_list(const std::vector<ggml_backend_dev_t> & de
     return buft_list;
 }
 
+ggml_tensor * llama_model::mul_mat_with_sinq(ggml_context * ctx, ggml_tensor * weight, ggml_tensor * input) const {
+    const char * weight_name = ggml_get_name(weight);
+    const auto * scales = get_sinq_scales(weight_name);
+    if (scales == nullptr || (scales->row.empty() && scales->col.empty())) {
+        return ggml_mul_mat(ctx, weight, input);
+    }
+
+    ggml_tensor * scaled_input = input;
+    if (!scales->col.empty()) {
+        GGML_ASSERT((int64_t) scales->col.size() == weight->ne[0]);
+        ggml_tensor * col = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, scales->col.size());
+        std::memcpy(col->data, scales->col.data(), scales->col.size() * sizeof(float));
+        std::string col_name = std::string(weight_name) + ".sinq_col";
+        ggml_set_name(col, col_name.c_str());
+        scaled_input = ggml_mul(ctx, scaled_input, col);
+    }
+
+    ggml_tensor * result = ggml_mul_mat(ctx, weight, scaled_input);
+
+    if (!scales->row.empty()) {
+        GGML_ASSERT((int64_t) scales->row.size() == weight->ne[1]);
+        ggml_tensor * row = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, scales->row.size());
+        std::memcpy(row->data, scales->row.data(), scales->row.size() * sizeof(float));
+        std::string row_name = std::string(weight_name) + ".sinq_row";
+        ggml_set_name(row, row_name.c_str());
+        result = ggml_mul(ctx, result, row);
+    }
+
+    return result;
+}
+
+ggml_tensor * llama_model::mul_mat_id_with_sinq(ggml_context * ctx, ggml_tensor * weight, ggml_tensor * input, ggml_tensor * ids) const {
+    const char * weight_name = ggml_get_name(weight);
+    const auto * scales = get_sinq_scales(weight_name);
+    if (scales == nullptr || (scales->row.empty() && scales->col.empty())) {
+        return ggml_mul_mat_id(ctx, weight, input, ids);
+    }
+
+    ggml_tensor * scaled_input = input;
+    if (!scales->col.empty()) {
+        GGML_ASSERT((int64_t) scales->col.size() == weight->ne[0]);
+        ggml_tensor * col = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, scales->col.size());
+        std::memcpy(col->data, scales->col.data(), scales->col.size() * sizeof(float));
+        std::string col_name = std::string(weight_name) + ".sinq_col";
+        ggml_set_name(col, col_name.c_str());
+        scaled_input = ggml_mul(ctx, scaled_input, col);
+    }
+
+    ggml_tensor * result = ggml_mul_mat_id(ctx, weight, scaled_input, ids);
+
+    if (!scales->row.empty()) {
+        GGML_ASSERT((int64_t) scales->row.size() == weight->ne[1]);
+        ggml_tensor * row = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, scales->row.size());
+        std::memcpy(row->data, scales->row.data(), scales->row.size() * sizeof(float));
+        std::string row_name = std::string(weight_name) + ".sinq_row";
+        ggml_set_name(row, row_name.c_str());
+        result = ggml_mul(ctx, result, row);
+    }
+
+    return result;
+}
+
 // GPU: split if LLAMA_SPLIT_MODE_ROW -> GPU
 static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode split_mode, const float * tensor_split) {
     buft_list_t buft_list;
@@ -437,6 +502,8 @@ struct llama_model::impl {
     std::vector<layer_dev> dev_layer;
 
     bool has_tensor_overrides;
+
+    std::unordered_map<std::string, llama_model::llama_sinq_scales> sinq_by_name;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -6109,6 +6176,34 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    for (const auto & kv : ml.weights_map) {
+        const std::string & tensor_name = kv.first;
+        std::vector<float> row_scale;
+        std::vector<float> col_scale;
+        if (ml.get_arr(tensor_name + ".sinq.row_scale", row_scale, false) &&
+            ml.get_arr(tensor_name + ".sinq.col_scale", col_scale, false)) {
+            llama_sinq_scales scales;
+            scales.row = std::move(row_scale);
+            scales.col = std::move(col_scale);
+            ml.get_key(tensor_name + ".sinq.imbalance", scales.imbalance, false);
+            pimpl->sinq_by_name.emplace(tensor_name, std::move(scales));
+        }
+    }
+
+#if defined(GGML_USE_CUDA)
+    for (const auto & kv : pimpl->sinq_by_name) {
+        const auto * tensor = get_tensor(kv.first.c_str());
+        if (tensor == nullptr) {
+            continue;
+        }
+        const auto & scales = kv.second;
+        ggml_backend_cuda_tensor_set_sinq(
+            tensor,
+            scales.row.empty() ? nullptr : scales.row.data(), (int64_t) scales.row.size(),
+            scales.col.empty() ? nullptr : scales.col.data(), (int64_t) scales.col.size());
+    }
+#endif
+
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
@@ -6395,6 +6490,14 @@ const ggml_tensor * llama_model::get_tensor(const char * name) const {
     }
 
     return it->second;
+}
+
+const llama_model::llama_sinq_scales * llama_model::get_sinq_scales(const std::string & tensor_name) const {
+    auto it = pimpl->sinq_by_name.find(tensor_name);
+    if (it == pimpl->sinq_by_name.end()) {
+        return nullptr;
+    }
+    return &it->second;
 }
 
 float llama_model::get_rope_freq_base (const llama_cparams & cparams, int il) const {
@@ -10341,7 +10444,7 @@ struct llm_build_minicpm3 : public llm_graph_context {
             {
                 ggml_tensor * q = NULL;
                 // {n_embd, q_lora_rank} * {n_embd, n_tokens} -> {q_lora_rank, n_tokens}
-                q = ggml_mul_mat(ctx0, model.layers[il].wq_a, cur);
+                q = model.mul_mat_with_sinq(ctx0, model.layers[il].wq_a, cur);
                 cb(q, "q", il);
 
                 q = build_norm(q,
@@ -10350,7 +10453,7 @@ struct llm_build_minicpm3 : public llm_graph_context {
                 cb(q, "q", il);
 
                 // {q_lora_rank, n_head * hparams.n_embd_head_k} * {q_lora_rank, n_tokens} -> {n_head * hparams.n_embd_head_k, n_tokens}
-                q = ggml_mul_mat(ctx0, model.layers[il].wq_b, q);
+                q = model.mul_mat_with_sinq(ctx0, model.layers[il].wq_b, q);
                 cb(q, "q", il);
 
                 // split into {n_head * n_embd_head_qk_nope, n_tokens}
@@ -10368,7 +10471,7 @@ struct llm_build_minicpm3 : public llm_graph_context {
                 cb(q_pe, "q_pe", il);
 
                 // {n_embd, kv_lora_rank + n_embd_head_qk_rope} * {n_embd, n_tokens} -> {kv_lora_rank + n_embd_head_qk_rope, n_tokens}
-                ggml_tensor * kv_pe_compresseed = ggml_mul_mat(ctx0, model.layers[il].wkv_a_mqa, cur);
+                ggml_tensor * kv_pe_compresseed = model.mul_mat_with_sinq(ctx0, model.layers[il].wkv_a_mqa, cur);
                 cb(kv_pe_compresseed, "kv_pe_compresseed", il);
 
                 // split into {kv_lora_rank, n_tokens}
@@ -10390,7 +10493,7 @@ struct llm_build_minicpm3 : public llm_graph_context {
                 cb(kv_compressed, "kv_compressed", il);
 
                 // {kv_lora_rank, n_head * (n_embd_head_qk_nope + n_embd_head_v)} * {kv_lora_rank, n_tokens} -> {n_head * (n_embd_head_qk_nope + n_embd_head_v), n_tokens}
-                ggml_tensor * kv = ggml_mul_mat(ctx0, model.layers[il].wkv_b, kv_compressed);
+                ggml_tensor * kv = model.mul_mat_with_sinq(ctx0, model.layers[il].wkv_b, kv_compressed);
                 cb(kv, "kv", il);
 
                 // split into {n_head * n_embd_head_qk_nope, n_tokens}
@@ -10927,7 +11030,7 @@ struct llm_build_gemma3n_iswa : public llm_graph_context {
         {
             ggml_tensor * target_magnitude = calc_magnitude(inpL);
             ggml_tensor * inp_repeated = ggml_repeat_4d(ctx0, inpL, n_embd, n_tokens, n_altup - 1, 1);
-            ggml_tensor * altup_added = ggml_mul_mat(ctx0, model.altup_proj, inp_repeated); // shape: [n_embd, n_tokens, n_altup - 1]
+            ggml_tensor * altup_added = model.mul_mat_with_sinq(ctx0, model.altup_proj, inp_repeated); // shape: [n_embd, n_tokens, n_altup - 1]
             ggml_tensor * new_magnitude = calc_magnitude(altup_added);
             altup_added = ggml_div(ctx0,
                                 ggml_mul(ctx0, altup_added, target_magnitude),
@@ -11110,7 +11213,7 @@ struct llm_build_gemma3n_iswa : public llm_graph_context {
                                                     ggml_row_size(cur->type, n_embd),
                                                     ggml_row_size(cur->type, n_embd*n_tokens),
                                                     n_embd*n_tokens*ggml_element_size(cur));
-            ggml_tensor * altup_unembd = ggml_mul_mat(ctx0, model.altup_unembd_proj, alt_slice); // shape: [n_embd, n_tokens, n_altup - 1]
+            ggml_tensor * altup_unembd = model.mul_mat_with_sinq(ctx0, model.altup_unembd_proj, alt_slice); // shape: [n_embd, n_tokens, n_altup - 1]
             ggml_tensor * new_magnitude = calc_magnitude(altup_unembd);
             altup_unembd = ggml_div(ctx0,
                                 ggml_mul(ctx0, altup_unembd, target_magnitude),
@@ -11196,7 +11299,7 @@ struct llm_build_gemma3n_iswa : public llm_graph_context {
         const float per_layer_projection_scale = 1.0f / sqrtf((float)n_embd);
         const float per_layer_input_scale      = 1.0f / sqrtf(2.0f);
 
-        ggml_tensor * per_layer_proj = ggml_mul_mat(ctx0, model.per_layer_model_proj, inputs_embeds);
+        ggml_tensor * per_layer_proj = model.mul_mat_with_sinq(ctx0, model.per_layer_model_proj, inputs_embeds);
         per_layer_proj = ggml_scale(ctx0, per_layer_proj, per_layer_projection_scale);
         per_layer_proj = ggml_reshape_3d(ctx0, per_layer_proj, n_embd_altup, n_layer, n_tokens);
         per_layer_proj = build_norm(per_layer_proj,
@@ -11252,7 +11355,7 @@ struct llm_build_gemma3n_iswa : public llm_graph_context {
         // router_input_scale
         router_inputs = ggml_scale(ctx0, router_inputs, 1.0f / (float)n_embd);
 
-        ggml_tensor * output = ggml_mul_mat(ctx0, model.layers[il].altup_router, router_inputs);
+        ggml_tensor * output = model.mul_mat_with_sinq(ctx0, model.layers[il].altup_router, router_inputs);
         return ggml_tanh(ctx0, output); // [n_altup, n_tokens]
     }
 
@@ -11270,7 +11373,7 @@ struct llm_build_gemma3n_iswa : public llm_graph_context {
 
         // permute to [n_altup, n_embd, n_tokens]
         ggml_tensor * cur_permuted = ggml_cont(ctx0, ggml_permute(ctx0, cur, 1, 2, 0, 3));
-        ggml_tensor * predictions = ggml_mul_mat(ctx0, cur_permuted, all_coefs); // [n_altup, n_embd, n_tokens]
+        ggml_tensor * predictions = model.mul_mat_with_sinq(ctx0, cur_permuted, all_coefs); // [n_altup, n_embd, n_tokens]
 
         // final shape must be the same as cur: [n_embd, n_tokens, n_altup]
         predictions = ggml_cont(ctx0, ggml_permute(ctx0, predictions, 0, 2, 1, 3));
@@ -13450,7 +13553,7 @@ struct llm_build_deepseek2 : public llm_graph_context {
             {
                 ggml_tensor * q = NULL;
                 if (!is_lite) {
-                    q = ggml_mul_mat(ctx0, model.layers[il].wq_a, cur);
+                    q = model.mul_mat_with_sinq(ctx0, model.layers[il].wq_a, cur);
                     cb(q, "q", il);
 
                     q = build_norm(q,
@@ -13458,10 +13561,10 @@ struct llm_build_deepseek2 : public llm_graph_context {
                             LLM_NORM_RMS, il);
                     cb(q, "q", il);
 
-                    q = ggml_mul_mat(ctx0, model.layers[il].wq_b, q);
+                    q = model.mul_mat_with_sinq(ctx0, model.layers[il].wq_b, q);
                     cb(q, "q", il);
                 } else {
-                    q = ggml_mul_mat(ctx0, model.layers[il].wq, cur);
+                    q = model.mul_mat_with_sinq(ctx0, model.layers[il].wq, cur);
                     cb(q, "q", il);
                 }
 
@@ -13481,7 +13584,7 @@ struct llm_build_deepseek2 : public llm_graph_context {
                         ggml_row_size(q->type, n_embd_head_qk_nope));
                 cb(q_pe, "q_pe", il);
 
-                ggml_tensor * kv_cmpr_pe = ggml_mul_mat(ctx0, model.layers[il].wkv_a_mqa, cur);
+                ggml_tensor * kv_cmpr_pe = model.mul_mat_with_sinq(ctx0, model.layers[il].wkv_a_mqa, cur);
                 cb(kv_cmpr_pe, "kv_cmpr_pe", il);
 
                 // split into {kv_lora_rank, n_tokens}
@@ -13522,7 +13625,7 @@ struct llm_build_deepseek2 : public llm_graph_context {
                     cb(q_nope, "q_nope_perm", il);
 
                     // {n_embd_head_qk_nope, kv_lora_rank, n_head} x {n_embd_head_qk_nope, n_tokens, n_head}
-                    ggml_tensor * q_nope_absorbed = ggml_mul_mat(ctx0, model.layers[il].wk_b, q_nope);
+                    ggml_tensor * q_nope_absorbed = model.mul_mat_with_sinq(ctx0, model.layers[il].wk_b, q_nope);
                     cb(q_nope_absorbed, "q_nope_absorbed", il);
 
                     // {kv_lora_rank, n_head, n_tokens}
@@ -13550,7 +13653,7 @@ struct llm_build_deepseek2 : public llm_graph_context {
                             model.layers[il].wo, NULL,
                             Qcur, Kcur, Vcur, nullptr, nullptr, model.layers[il].wv_b, kq_scale, il);
                 } else {
-                    ggml_tensor * kv = ggml_mul_mat(ctx0, model.layers[il].wkv_b, kv_cmpr);
+                    ggml_tensor * kv = model.mul_mat_with_sinq(ctx0, model.layers[il].wkv_b, kv_cmpr);
                     cb(kv, "kv", il);
 
                     // split into {n_embd_head_qk_nope, n_head, n_tokens}
@@ -13657,7 +13760,7 @@ struct llm_build_deepseek2 : public llm_graph_context {
         res->t_embd = cur;
 
         // lm_head
-        cur = ggml_mul_mat(ctx0, model.output, cur);
+        cur = model.mul_mat_with_sinq(ctx0, model.output, cur);
 
         cb(cur, "result_output", -1);
         res->t_logits = cur;
@@ -14018,7 +14121,7 @@ struct llm_build_t5_dec : public llm_graph_context {
                 //ggml_tensor * q =                 ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
                 //ggml_tensor * k = ggml_cont(ctx0, ggml_permute(ctx0, Kcur, 0, 2, 1, 3));
 
-                //ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
+                //ggml_tensor * kq = model.mul_mat_with_sinq(ctx0, k, q);
                 //cb(kq, "kq", il);
 
                 //kq = ggml_soft_max_ext(ctx0, kq, KQ_mask_cross, 1.0f, hparams.f_max_alibi_bias);
@@ -14027,7 +14130,7 @@ struct llm_build_t5_dec : public llm_graph_context {
                 //ggml_tensor * v = ggml_cont(ctx0, ggml_transpose(ctx0, ggml_reshape_2d(ctx0, Vcur, n_embd_gqa, n_outputs_enc)));
                 //cb(v, "v", il);
 
-                //ggml_tensor * kqv = ggml_mul_mat(ctx0, ggml_reshape_3d(ctx0, v, n_outputs_enc, n_embd_head, n_head_kv), kq);
+                //ggml_tensor * kqv = model.mul_mat_with_sinq(ctx0, ggml_reshape_3d(ctx0, v, n_outputs_enc, n_embd_head, n_head_kv), kq);
                 //cb(kqv, "kqv", il);
 
                 //ggml_tensor * kqv_merged = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
@@ -15228,7 +15331,7 @@ struct llm_build_rwkv6_base : public llm_graph_context {
                 ctx0,
                 ggml_tanh(
                     ctx0,
-                    ggml_mul_mat(ctx0, layer.time_mix_w1, xxx)
+                    model.mul_mat_with_sinq(ctx0, layer.time_mix_w1, xxx)
                     ),
                 layer.time_mix_w1->ne[1] / 5, 1, 5, n_tokens
                 );
@@ -15309,7 +15412,7 @@ struct llm_build_rwkv6_base : public llm_graph_context {
                 layer.time_mix_decay_w2,
                 ggml_tanh(
                     ctx0,
-                    ggml_mul_mat(ctx0, layer.time_mix_decay_w1, xw)
+                    model.mul_mat_with_sinq(ctx0, layer.time_mix_decay_w1, xw)
                     )
                 );
 
@@ -15628,7 +15731,7 @@ struct llm_build_rwkv7_base : public llm_graph_context {
         ggml_tensor * r = build_lora_mm(layer.time_mix_receptance, xr);
         ggml_tensor * w = ggml_add(
             ctx0,
-            ggml_mul_mat(ctx0, layer.time_mix_w2, ggml_tanh(ctx0, ggml_mul_mat(ctx0, layer.time_mix_w1, xw))),
+            model.mul_mat_with_sinq(ctx0, layer.time_mix_w2, ggml_tanh(ctx0, model.mul_mat_with_sinq(ctx0, layer.time_mix_w1, xw))),
             layer.time_mix_w0
         );
         w = ggml_exp(ctx0, ggml_scale(ctx0, ggml_sigmoid(ctx0, w), -0.606531));
@@ -15643,7 +15746,7 @@ struct llm_build_rwkv7_base : public llm_graph_context {
                 ggml_mul(ctx0,
                     ggml_sub(ctx0, first_layer_value, v),
                     ggml_sigmoid(ctx0, ggml_add(ctx0,
-                            ggml_mul_mat(ctx0, layer.time_mix_v2, ggml_mul_mat(ctx0, layer.time_mix_v1, xv)),
+                            model.mul_mat_with_sinq(ctx0, layer.time_mix_v2, model.mul_mat_with_sinq(ctx0, layer.time_mix_v1, xv)),
                             layer.time_mix_v0
                         )
                     )
@@ -15653,13 +15756,13 @@ struct llm_build_rwkv7_base : public llm_graph_context {
 
         ggml_tensor * g = nullptr;
         if (layer.time_mix_g1 && layer.time_mix_g2) {
-            g = ggml_mul_mat(ctx0, layer.time_mix_g2, ggml_sigmoid(ctx0, ggml_mul_mat(ctx0, layer.time_mix_g1, xg)));
+            g = model.mul_mat_with_sinq(ctx0, layer.time_mix_g2, ggml_sigmoid(ctx0, model.mul_mat_with_sinq(ctx0, layer.time_mix_g1, xg)));
         }
 
         ggml_tensor * a = ggml_sigmoid(ctx0,
             ggml_add(
                 ctx0,
-                ggml_mul_mat(ctx0, layer.time_mix_a2, ggml_mul_mat(ctx0, layer.time_mix_a1, xa)),
+                model.mul_mat_with_sinq(ctx0, layer.time_mix_a2, model.mul_mat_with_sinq(ctx0, layer.time_mix_a1, xa)),
                 layer.time_mix_a0
             )
         );
@@ -16591,11 +16694,11 @@ struct llm_build_wavtokenizer_dec : public llm_graph_context {
                         q = ggml_cont(ctx0, ggml_transpose(ctx0, q));
                         k = ggml_cont(ctx0, ggml_transpose(ctx0, k));
 
-                        ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
+                        ggml_tensor * kq = model.mul_mat_with_sinq(ctx0, k, q);
 
                         kq = ggml_soft_max_ext(ctx0, kq, nullptr, 1.0f/sqrtf(float(hparams.posnet.n_embd)), 0.0f);
 
-                        cur = ggml_mul_mat(ctx0, kq, v);
+                        cur = model.mul_mat_with_sinq(ctx0, kq, v);
 
                         cur = ggml_conv_1d_ph(ctx0, layer.attn_o, cur, 1, 1);
                         cur = ggml_add(ctx0, cur, layer.attn_o_b);
@@ -16708,7 +16811,7 @@ struct llm_build_plm : public llm_graph_context {
             // self_attention
             {
                 ggml_tensor * q = NULL;
-                q = ggml_mul_mat(ctx0, model.layers[il].wq, cur);
+                q = model.mul_mat_with_sinq(ctx0, model.layers[il].wq, cur);
                 cb(q, "q", il);
 
                 // split into {n_head * n_embd_head_qk_nope, n_tokens}
@@ -16726,7 +16829,7 @@ struct llm_build_plm : public llm_graph_context {
                 cb(q_pe, "q_pe", il);
 
                 // {n_embd, kv_lora_rank + n_embd_head_qk_rope} * {n_embd, n_tokens} -> {kv_lora_rank + n_embd_head_qk_rope, n_tokens}
-                ggml_tensor * kv_pe_compresseed = ggml_mul_mat(ctx0, model.layers[il].wkv_a_mqa, cur);
+                ggml_tensor * kv_pe_compresseed = model.mul_mat_with_sinq(ctx0, model.layers[il].wkv_a_mqa, cur);
                 cb(kv_pe_compresseed, "kv_pe_compresseed", il);
 
                 // split into {kv_lora_rank, n_tokens}
@@ -16748,7 +16851,7 @@ struct llm_build_plm : public llm_graph_context {
                 cb(kv_compressed, "kv_compressed", il);
 
                 // {kv_lora_rank, n_head * (n_embd_head_qk_nope + n_embd_head_v)} * {kv_lora_rank, n_tokens} -> {n_head * (n_embd_head_qk_nope + n_embd_head_v), n_tokens}
-                ggml_tensor * kv = ggml_mul_mat(ctx0, model.layers[il].wkv_b, kv_compressed);
+                ggml_tensor * kv = model.mul_mat_with_sinq(ctx0, model.layers[il].wkv_b, kv_compressed);
                 cb(kv, "kv", il);
 
                 // split into {n_head * n_embd_head_qk_nope, n_tokens}

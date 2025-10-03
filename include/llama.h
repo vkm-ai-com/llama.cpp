@@ -359,6 +359,10 @@ extern "C" {
         bool only_copy;                       // only copy tensors - ftype, allow_requantize and quantize_output_tensor are ignored
         bool pure;                            // quantize all tensors to the default type
         bool keep_split;                      // quantize to the same number of shards
+        bool use_sinq;                        // enable Sinkhorn-Normalized Quantization preconditioning
+        int32_t sinq_iterations;              // number of Sinkhorn normalization iterations
+        float sinq_min_std;                   // minimum allowed standard deviation during normalization
+        float sinq_max_log_delta;             // clamp on log-scale updates per iteration
         void * imatrix;                       // pointer to importance matrix data
         void * kv_overrides;                  // pointer to vector containing overrides
         void * tensor_types;                  // pointer to vector containing tensor types

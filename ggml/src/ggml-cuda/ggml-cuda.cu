@@ -34,6 +34,7 @@
 #include "ggml-cuda/pad.cuh"
 #include "ggml-cuda/pool2d.cuh"
 #include "ggml-cuda/quantize.cuh"
+#include "ggml-cuda/cpy.cuh"
 #include "ggml-cuda/rope.cuh"
 #include "ggml-cuda/roll.cuh"
 #include "ggml-cuda/scale.cuh"
@@ -66,6 +67,7 @@
 #include <initializer_list>
 #include <limits>
 #include <map>
+#include <unordered_map>
 #include <memory>
 #include <mutex>
 #include <stdarg.h>
@@ -75,6 +77,75 @@
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
+
+struct ggml_cuda_sinq_scales {
+    std::vector<float> row;
+    std::vector<float> col;
+};
+
+static std::mutex g_sinq_mutex;
+static std::unordered_map<const ggml_tensor *, ggml_cuda_sinq_scales> g_sinq_scales;
+
+GGML_API void ggml_backend_cuda_tensor_set_sinq(
+        const struct ggml_tensor * tensor,
+        const float * row_scale, int64_t row_len,
+        const float * col_scale, int64_t col_len) {
+    if (tensor == nullptr) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> guard(g_sinq_mutex);
+    ggml_cuda_sinq_scales & entry = g_sinq_scales[tensor];
+    if (row_scale != nullptr && row_len > 0) {
+        entry.row.assign(row_scale, row_scale + row_len);
+    } else {
+        entry.row.clear();
+    }
+    if (col_scale != nullptr && col_len > 0) {
+        entry.col.assign(col_scale, col_scale + col_len);
+    } else {
+        entry.col.clear();
+    }
+}
+
+GGML_API void ggml_backend_cuda_tensor_clear_sinq(const struct ggml_tensor * tensor) {
+    if (tensor == nullptr) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> guard(g_sinq_mutex);
+    g_sinq_scales.erase(tensor);
+}
+
+static const ggml_cuda_sinq_scales * ggml_cuda_get_sinq_scales(const ggml_tensor * tensor) {
+    if (tensor == nullptr) {
+        return nullptr;
+    }
+
+    std::lock_guard<std::mutex> guard(g_sinq_mutex);
+    auto it = g_sinq_scales.find(tensor);
+    if (it == g_sinq_scales.end()) {
+        return nullptr;
+    }
+
+    return &it->second;
+}
+
+template <typename T>
+static __global__ void sinq_scale_matrix_kernel(
+        T * data,
+        const float * scales,
+        int64_t ncols,
+        int64_t nrows) {
+    const int64_t col = blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t row = blockIdx.y * blockDim.y + threadIdx.y;
+    if (col >= ncols || row >= nrows) {
+        return;
+    }
+
+    const int64_t index = row * ncols + col;
+    data[index] *= scales[col];
+}
 
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
@@ -2001,6 +2072,47 @@ static void ggml_cuda_mul_mat_batched_cublas(ggml_backend_cuda_context & ctx, co
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
 
+    const ggml_cuda_sinq_scales * sinq_scales = ggml_cuda_get_sinq_scales(src0);
+    const bool apply_sinq_col = sinq_scales != nullptr && !sinq_scales->col.empty();
+    const bool apply_sinq_row = sinq_scales != nullptr && !sinq_scales->row.empty();
+
+    ggml_tensor src1_sinq = *src1;
+    const ggml_tensor * src1_compute = src1;
+    ggml_cuda_pool_alloc<float> sinq_col_dev;
+    ggml_cuda_pool_alloc<float> sinq_row_dev;
+    ggml_cuda_pool_alloc<float> sinq_src1_dev;
+
+    if (apply_sinq_col) {
+        GGML_ASSERT(src1->type == GGML_TYPE_F32);
+        GGML_ASSERT((int64_t) sinq_scales->col.size() == src0->ne[0]);
+
+        const int64_t nelements_src1 = ggml_nelements(src1);
+        float * src1_tmp = sinq_src1_dev.alloc(ctx.pool(), nelements_src1);
+
+        src1_sinq.buffer = src1->buffer;
+        src1_sinq.data   = src1_tmp;
+        src1_sinq.nb[0]  = ggml_type_size(src1_sinq.type);
+        src1_sinq.nb[1]  = src1_sinq.nb[0] * src1_sinq.ne[0];
+        src1_sinq.nb[2]  = src1_sinq.nb[1] * src1_sinq.ne[1];
+        src1_sinq.nb[3]  = src1_sinq.nb[2] * src1_sinq.ne[2];
+
+        ggml_cuda_cpy(ctx, src1, &src1_sinq);
+
+        float * col_dev = sinq_col_dev.alloc(ctx.pool(), sinq_scales->col.size());
+        CUDA_CHECK(cudaMemcpyAsync(col_dev, sinq_scales->col.data(),
+                                   sinq_scales->col.size()*sizeof(float),
+                                   cudaMemcpyHostToDevice, ctx.stream()));
+
+        const int64_t ncols = src1->ne[0];
+        const int64_t nrows = ggml_nrows(src1);
+        dim3 blockDim(32, 32);
+        dim3 gridDim((unsigned) ((ncols + blockDim.x - 1) / blockDim.x),
+                     (unsigned) ((nrows + blockDim.y - 1) / blockDim.y));
+        sinq_scale_matrix_kernel<<<gridDim, blockDim, 0, ctx.stream()>>>(src1_tmp, col_dev, ncols, nrows);
+
+        src1_compute = &src1_sinq;
+    }
+
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
     // Therefore, in such cases use cuBLAS.
@@ -2061,25 +2173,42 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (!split && use_mul_mat_vec_f) {
         // the custom F16 vector kernel can be used over batched cuBLAS GEMM
         // but this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
-        ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
+        ggml_cuda_mul_mat_vec_f(ctx, src0, src1_compute, nullptr, dst);
     } else if (!split && use_mul_mat_f) {
-        ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
+        ggml_cuda_mul_mat_f(ctx, src0, src1_compute, nullptr, dst);
     } else if (!split && use_mul_mat_vec_q) {
-        ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
+        ggml_cuda_mul_mat_vec_q(ctx, src0, src1_compute, nullptr, dst);
     } else if (!split && use_mul_mat_q) {
-        ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+        ggml_cuda_mul_mat_q(ctx, src0, src1_compute, nullptr, dst);
     } else if (!split && (use_batched_cublas_f16 || use_batched_cublas_bf16 || use_batched_cublas_f32)
-        && !ggml_is_transposed(src0) && !ggml_is_transposed(src1) && src1->ne[2]*src1->ne[3] > 1) {
+        && !ggml_is_transposed(src0) && !ggml_is_transposed(src1_compute) && src1_compute->ne[2]*src1_compute->ne[3] > 1) {
         // general KQ + KQV multi-batch without FlashAttention
-        ggml_cuda_mul_mat_batched_cublas(ctx, src0, src1, dst);
+        ggml_cuda_mul_mat_batched_cublas(ctx, src0, src1_compute, dst);
     } else if (use_mul_mat_vec_f) {
-        ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_vec_f, nullptr);
+        ggml_cuda_op_mul_mat(ctx, src0, src1_compute, dst, ggml_cuda_op_mul_mat_vec_f, nullptr);
     } else if (use_mul_mat_vec_q) {
-        ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_vec_q, quantize_row_q8_1_cuda);
+        ggml_cuda_op_mul_mat(ctx, src0, src1_compute, dst, ggml_cuda_op_mul_mat_vec_q, quantize_row_q8_1_cuda);
     } else if (use_mul_mat_q) {
-        ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_q, quantize_mmq_q8_1_cuda);
+        ggml_cuda_op_mul_mat(ctx, src0, src1_compute, dst, ggml_cuda_op_mul_mat_q, quantize_mmq_q8_1_cuda);
     } else {
-        ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_cublas, nullptr);
+        ggml_cuda_op_mul_mat(ctx, src0, src1_compute, dst, ggml_cuda_op_mul_mat_cublas, nullptr);
+    }
+
+    if (apply_sinq_row) {
+        GGML_ASSERT(dst->type == GGML_TYPE_F32);
+        GGML_ASSERT((int64_t) sinq_scales->row.size() == src0->ne[1]);
+
+        float * row_dev = sinq_row_dev.alloc(ctx.pool(), sinq_scales->row.size());
+        CUDA_CHECK(cudaMemcpyAsync(row_dev, sinq_scales->row.data(),
+                                   sinq_scales->row.size()*sizeof(float),
+                                   cudaMemcpyHostToDevice, ctx.stream()));
+
+        const int64_t ncols_dst = dst->ne[0];
+        const int64_t nrows_dst = ggml_nrows(dst);
+        dim3 blockDim(32, 32);
+        dim3 gridDim((unsigned) ((ncols_dst + blockDim.x - 1) / blockDim.x),
+                     (unsigned) ((nrows_dst + blockDim.y - 1) / blockDim.y));
+        sinq_scale_matrix_kernel<<<gridDim, blockDim, 0, ctx.stream()>>>((float *) dst->data, row_dev, ncols_dst, nrows_dst);
     }
 }
 
