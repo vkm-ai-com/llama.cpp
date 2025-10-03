@@ -178,6 +178,12 @@ static bool llama_tensor_apply_sinq(
     std::vector<float> row_std;
     std::vector<float> col_std;
 
+    std::vector<float> best_normalized;
+    std::vector<float> best_row_logs;
+    std::vector<float> best_col_logs;
+    std::vector<float> best_row_std;
+    std::vector<float> best_col_std;
+
     float best_imbalance = std::numeric_limits<float>::infinity();
     int   stagnant_iters = 0;
 
@@ -260,17 +266,41 @@ static bool llama_tensor_apply_sinq(
         if (imbalance_curr + 1e-4f < best_imbalance) {
             best_imbalance = imbalance_curr;
             stagnant_iters = 0;
+
+            best_normalized = normalized;
+            best_row_logs   = row_logs;
+            best_col_logs   = col_logs;
+            best_row_std    = row_std;
+            best_col_std    = col_std;
         } else {
             ++stagnant_iters;
             if (stagnant_iters >= 2) {
+                if (!best_normalized.empty()) {
+                    normalized     = best_normalized;
+                    row_logs       = best_row_logs;
+                    col_logs       = best_col_logs;
+                    row_std        = best_row_std;
+                    col_std        = best_col_std;
+                }
                 break;
             }
         }
     }
 
-    if (row_std.empty() || col_std.empty()) {
-        sinq_compute_row_std(normalized.data(), nrows, ncols, row_std);
-        sinq_compute_col_std(normalized.data(), nrows, ncols, col_std);
+    if (!best_normalized.empty()) {
+        normalized = best_normalized;
+        row_logs   = best_row_logs;
+        col_logs   = best_col_logs;
+    }
+
+    if (best_imbalance == std::numeric_limits<float>::infinity()) {
+        if (row_std.empty() || col_std.empty()) {
+            sinq_compute_row_std(normalized.data(), nrows, ncols, row_std);
+            sinq_compute_col_std(normalized.data(), nrows, ncols, col_std);
+        }
+    } else {
+        row_std = best_row_std;
+        col_std = best_col_std;
     }
 
     float min_final = std::min(sinq_min_positive(row_std), sinq_min_positive(col_std));
@@ -281,7 +311,11 @@ static bool llama_tensor_apply_sinq(
     if (!std::isfinite(max_final) || max_final <= 0.0f) {
         max_final = sigma_min;
     }
-    imbalance_out = max_final / std::max(min_final, params.sinq_min_std);
+    if (best_imbalance == std::numeric_limits<float>::infinity()) {
+        imbalance_out = max_final / std::max(min_final, params.sinq_min_std);
+    } else {
+        imbalance_out = best_imbalance;
+    }
 
     row_scale.resize(nrows);
     col_scale.resize(ncols);
