@@ -159,6 +159,9 @@ static bool llama_tensor_apply_sinq(
     // Follow Algorithm 1 from "SINQ: Sinkhorn-Normalized Quantization for Calibration-Free
     // Low-Precision LLM Weights" (https://arxiv.org/abs/2509.22944): copy the original matrix
     // and alternately normalize column and row standard deviations via Sinkhorn-style updates.
+    // Section 2.2.1 of the paper further recommends accumulating the scale factors in the
+    // log-domain, clipping update magnitudes, and using imbalance-driven early stopping; we do
+    // the same below while keeping the per-axis floor sigma_min from Algorithm 1.
     normalized.assign(original, original + (size_t) nrows * (size_t) ncols);
 
     std::vector<float> row_std_orig;
@@ -172,6 +175,7 @@ static bool llama_tensor_apply_sinq(
     } else {
         sigma_min = std::max(params.sinq_min_std, sigma_min);
     }
+    const float log_sigma_min = std::log(std::max(sigma_min, std::numeric_limits<float>::min()));
 
     std::vector<float> row_logs(nrows, 0.0f);
     std::vector<float> col_logs(ncols, 0.0f);
@@ -200,12 +204,15 @@ static bool llama_tensor_apply_sinq(
             float log_sigma = std::log(std::max(sigma, std::numeric_limits<float>::min()));
             if (params.sinq_max_log_delta > 0.0f) {
                 log_sigma = std::clamp(log_sigma, -params.sinq_max_log_delta, params.sinq_max_log_delta);
+                if (log_sigma < log_sigma_min) {
+                    log_sigma = log_sigma_min;
+                }
             }
 
             sigma = std::exp(log_sigma);
             if (!std::isfinite(sigma) || sigma <= 0.0f || sigma < sigma_min) {
                 sigma = sigma_min;
-                log_sigma = std::log(std::max(sigma, std::numeric_limits<float>::min()));
+                log_sigma = log_sigma_min;
             }
 
             col_logs[j] += log_sigma;
@@ -229,12 +236,15 @@ static bool llama_tensor_apply_sinq(
             float log_sigma = std::log(std::max(sigma, std::numeric_limits<float>::min()));
             if (params.sinq_max_log_delta > 0.0f) {
                 log_sigma = std::clamp(log_sigma, -params.sinq_max_log_delta, params.sinq_max_log_delta);
+                if (log_sigma < log_sigma_min) {
+                    log_sigma = log_sigma_min;
+                }
             }
 
             sigma = std::exp(log_sigma);
             if (!std::isfinite(sigma) || sigma <= 0.0f || sigma < sigma_min) {
                 sigma = sigma_min;
-                log_sigma = std::log(std::max(sigma, std::numeric_limits<float>::min()));
+                log_sigma = log_sigma_min;
             }
 
             row_logs[i] += log_sigma;
