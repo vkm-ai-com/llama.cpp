@@ -2159,8 +2159,31 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         }
     }
 
-    const bool apply_sinq_col = sinq_col != nullptr;
-    const bool apply_sinq_row = sinq_row != nullptr;
+    bool apply_sinq_col = sinq_col != nullptr;
+    bool apply_sinq_row = sinq_row != nullptr;
+
+    const char * tensor_name = src0->name ? src0->name : "unnamed";
+
+    if (apply_sinq_col && (int64_t) sinq_col->size() != src0->ne[0]) {
+        GGML_LOG_WARN(
+            "%s: skipping SINQ column scaling for tensor '%s' due to shape mismatch (expected %lld, got %zu)\n",
+            __func__, tensor_name, (long long) src0->ne[0], sinq_col->size());
+        apply_sinq_col = false;
+    }
+
+    if (apply_sinq_row) {
+        if ((int64_t) sinq_row->size() != dst->ne[0]) {
+            GGML_LOG_WARN(
+                "%s: skipping SINQ row scaling for tensor '%s' due to shape mismatch (expected %lld, got %zu)\n",
+                __func__, tensor_name, (long long) dst->ne[0], sinq_row->size());
+            apply_sinq_row = false;
+        } else if (dst->type != GGML_TYPE_F32) {
+            GGML_LOG_WARN(
+                "%s: skipping SINQ row scaling for tensor '%s' with unsupported destination type %s\n",
+                __func__, tensor_name, ggml_type_name(dst->type));
+            apply_sinq_row = false;
+        }
+    }
 
     ggml_tensor src1_sinq = *src1;
     // src1_sinq is a temporary tensor that borrows the buffer from src1 but
@@ -2179,8 +2202,6 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     ggml_cuda_pool_alloc<nv_bfloat16> sinq_src1_dev_bf16;
 
     if (apply_sinq_col) {
-        GGML_ASSERT((int64_t) sinq_col->size() == src0->ne[0]);
-
         const int64_t nelements_src1 = ggml_nelements(src1);
 
         void * src1_tmp = nullptr;
@@ -2195,9 +2216,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
                 src1_tmp = sinq_src1_dev_bf16.alloc(ctx.pool(), nelements_src1);
                 break;
             default:
-                GGML_ABORT("unsupported tensor type for sinq column scaling");
+                GGML_LOG_WARN(
+                    "%s: skipping SINQ column scaling for tensor '%s' with unsupported input type %s\n",
+                    __func__, tensor_name, ggml_type_name(src1->type));
+                apply_sinq_col = false;
         }
 
+        if (apply_sinq_col) {
         src1_sinq.buffer = src1->buffer;
         src1_sinq.data   = src1_tmp;
         src1_sinq.nb[0]  = ggml_type_size(src1_sinq.type);
@@ -2231,10 +2256,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
                         static_cast<nv_bfloat16 *>(src1_tmp), col_dev, ncols, nrows);
                 break;
             default:
-                GGML_ABORT("unsupported tensor type for sinq column scaling");
+                // This should not happen because unsupported types disable the scaling above.
+                GGML_ABORT("unexpected tensor type for sinq column scaling");
         }
+        CUDA_CHECK(cudaGetLastError());
 
         src1_compute = &src1_sinq;
+        }
     }
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
@@ -2319,9 +2347,6 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
 
     if (apply_sinq_row) {
-        GGML_ASSERT(dst->type == GGML_TYPE_F32);
-        GGML_ASSERT((int64_t) sinq_row->size() == dst->ne[0]);
-
         // Apply the per-output scaling after the matrix multiply, mirroring Eq. (6)
         // of the SINQ paper (https://arxiv.org/abs/2509.22944).
         float * row_dev = sinq_row_dev.alloc(ctx.pool(), sinq_row->size());
@@ -2335,6 +2360,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         dim3 gridDim((unsigned) ((ncols_dst + blockDim.x - 1) / blockDim.x),
                      (unsigned) ((nrows_dst + blockDim.y - 1) / blockDim.y));
         sinq_scale_matrix_rows_kernel<<<gridDim, blockDim, 0, ctx.stream()>>>((float *) dst->data, row_dev, ncols_dst, nrows_dst);
+        CUDA_CHECK(cudaGetLastError());
     }
 }
 
