@@ -2,6 +2,8 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#include <cstring>
+
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
@@ -2193,7 +2195,28 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 #endif
     }
 
-    ggml_tensor src1_sinq = *src1;
+    struct sinq_tensor_extra_guard {
+        ggml_tensor * tensor = nullptr;
+
+        ~sinq_tensor_extra_guard() {
+            if (tensor != nullptr) {
+                delete static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
+                tensor->extra = nullptr;
+            }
+        }
+    } src1_sinq_extra_guard;
+
+    ggml_tensor src1_sinq;
+    std::memset(&src1_sinq, 0, sizeof(src1_sinq));
+    src1_sinq.type   = src1->type;
+    src1_sinq.buffer = src1->buffer;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        src1_sinq.ne[i] = src1->ne[i];
+        src1_sinq.nb[i] = src1->nb[i];
+    }
+    if (src1->name[0] != '\0') {
+        std::memcpy(src1_sinq.name, src1->name, sizeof(src1_sinq.name));
+    }
     // src1_sinq is a temporary tensor that uses a scratch buffer to hold the
     // column-scaled activations.  Any backend metadata associated with the
     // original tensor (buffer handles, extra CUDA bookkeeping, graph links,
@@ -2211,7 +2234,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     src1_sinq.view_offs = 0;
     src1_sinq.op        = GGML_OP_NONE;
     std::fill(std::begin(src1_sinq.op_params), std::end(src1_sinq.op_params), 0);
-    src1_sinq.flags     = 0;
+    src1_sinq.flags     = src1->flags;
     for (auto & src_entry : src1_sinq.src) {
         src_entry = nullptr;
     }
@@ -2249,6 +2272,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             src1_sinq.nb[1]  = src1_sinq.nb[0] * src1_sinq.ne[0];
             src1_sinq.nb[2]  = src1_sinq.nb[1] * src1_sinq.ne[1];
             src1_sinq.nb[3]  = src1_sinq.nb[2] * src1_sinq.ne[2];
+
+            auto * extra_gpu = new ggml_tensor_extra_gpu{};
+            extra_gpu->data_device[ctx.device] = src1_tmp;
+            src1_sinq.extra = extra_gpu;
+            src1_sinq_extra_guard.tensor = &src1_sinq;
 
             // Disable copy indirection here because this temporary tensor is not a
             // persistent graph node.  Otherwise CUDA graph capture would assume an
