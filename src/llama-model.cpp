@@ -6290,25 +6290,37 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             continue;
         }
 
-        bool has_any_scale = true;
+        const int64_t tensor_cols = tensor->ne[0];
+        const int64_t tensor_rows = tensor->ne[1];
 
-        if (!scales.col.empty() && (int64_t) scales.col.size() != tensor->ne[0]) {
-            LLAMA_LOG_WARN(
-                "%s: ignoring SINQ column scales for tensor '%s' (expected %" PRId64 ", got %zu)\n",
-                __func__, tensor_name.c_str(), tensor->ne[0], scales.col.size());
-            scales.col.clear();
+        const size_t col_size = scales.col.size();
+        const size_t row_size = scales.row.size();
+
+        const bool matches_direct =
+            (scales.col.empty() || (int64_t) col_size == tensor_cols) &&
+            (scales.row.empty() || (int64_t) row_size == tensor_rows);
+        const bool matches_transposed =
+            (scales.col.empty() || (int64_t) col_size == tensor_rows) &&
+            (scales.row.empty() || (int64_t) row_size == tensor_cols);
+
+        if (!matches_direct) {
+            if (matches_transposed) {
+                LLAMA_LOG_DEBUG(
+                    "%s: swapping SINQ scales for tensor '%s' to match transposed layout\n",
+                    __func__, tensor_name.c_str());
+                std::swap(scales.row, scales.col);
+            } else if (!scales.col.empty() || !scales.row.empty()) {
+                LLAMA_LOG_WARN(
+                    "%s: ignoring SINQ scales for tensor '%s' due to shape mismatch (col = %zu, row = %zu, expected %lld x %lld or %lld x %lld)\n",
+                    __func__, tensor_name.c_str(), col_size, row_size,
+                    (long long) tensor_cols, (long long) tensor_rows,
+                    (long long) tensor_rows, (long long) tensor_cols);
+                it = pimpl->sinq_by_name.erase(it);
+                continue;
+            }
         }
 
-        if (!scales.row.empty() && (int64_t) scales.row.size() != tensor->ne[1]) {
-            LLAMA_LOG_WARN(
-                "%s: ignoring SINQ row scales for tensor '%s' (expected %" PRId64 ", got %zu)\n",
-                __func__, tensor_name.c_str(), tensor->ne[1], scales.row.size());
-            scales.row.clear();
-        }
-
-        has_any_scale = !scales.row.empty() || !scales.col.empty();
-
-        if (!has_any_scale) {
+        if (scales.row.empty() && scales.col.empty()) {
             it = pimpl->sinq_by_name.erase(it);
             continue;
         }
