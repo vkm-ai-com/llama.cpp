@@ -2333,28 +2333,54 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             ggml_type_name(src1->type), ggml_type_name(dst->type));
     }
 
+    auto with_sinq_device = [&](auto && fn) {
+        const int prev_ctx_device     = ctx.device;
+        const int prev_runtime_device = ggml_cuda_get_device();
+
+        if (prev_ctx_device != sinq_device) {
+            ctx.device = sinq_device;
+        }
+        if (prev_runtime_device != sinq_device) {
+            ggml_cuda_set_device(sinq_device);
+        }
+
+        cudaStream_t sinq_stream = ctx.stream(sinq_device, 0);
+        fn(sinq_stream);
+
+        if (prev_ctx_device != sinq_device) {
+            ctx.device = prev_ctx_device;
+        }
+        if (prev_runtime_device != sinq_device) {
+            ggml_cuda_set_device(prev_runtime_device);
+        }
+    };
+
     if (apply_sinq_col) {
         const int64_t nelements_src1 = ggml_nelements(src1);
 
-        void * src1_tmp = nullptr;
-        switch (src1->type) {
-            case GGML_TYPE_F32:
-                src1_tmp = sinq_src1_dev_f32.alloc(sinq_pool, nelements_src1);
-                break;
-            case GGML_TYPE_F16:
-                src1_tmp = sinq_src1_dev_f16.alloc(sinq_pool, nelements_src1);
-                break;
-            case GGML_TYPE_BF16:
-                src1_tmp = sinq_src1_dev_bf16.alloc(sinq_pool, nelements_src1);
-                break;
-            default:
-                GGML_LOG_WARN(
-                    "%s: skipping SINQ column scaling for tensor '%s' with unsupported input type %s\n",
-                    __func__, tensor_name, ggml_type_name(src1->type));
-                apply_sinq_col = false;
-        }
+        with_sinq_device([&](cudaStream_t sinq_stream) {
+            void * src1_tmp = nullptr;
+            switch (src1->type) {
+                case GGML_TYPE_F32:
+                    src1_tmp = sinq_src1_dev_f32.alloc(sinq_pool, nelements_src1);
+                    break;
+                case GGML_TYPE_F16:
+                    src1_tmp = sinq_src1_dev_f16.alloc(sinq_pool, nelements_src1);
+                    break;
+                case GGML_TYPE_BF16:
+                    src1_tmp = sinq_src1_dev_bf16.alloc(sinq_pool, nelements_src1);
+                    break;
+                default:
+                    GGML_LOG_WARN(
+                        "%s: skipping SINQ column scaling for tensor '%s' with unsupported input type %s\n",
+                        __func__, tensor_name, ggml_type_name(src1->type));
+                    apply_sinq_col = false;
+            }
 
-        if (apply_sinq_col) {
+            if (!apply_sinq_col) {
+                return;
+            }
+
             src1_sinq.data   = src1_tmp;
             src1_sinq.nb[0]  = ggml_type_size(src1_sinq.type);
             src1_sinq.nb[1]  = src1_sinq.nb[0] * src1_sinq.ne[0];
@@ -2375,7 +2401,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             }
 
             float * col_dev = sinq_col_dev.alloc(sinq_pool, sinq_col->size());
-            CUDA_CHECK(sinq_cuda_memcpy_h2d(col_dev, sinq_col->data(), sinq_col->size(), ctx.stream()));
+            CUDA_CHECK(sinq_cuda_memcpy_h2d(col_dev, sinq_col->data(), sinq_col->size(), sinq_stream));
 
             const int64_t ncols = src1->ne[0];
             const int64_t nrows = ggml_nrows(src1);
@@ -2384,15 +2410,15 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
                          (unsigned) ((nrows + blockDim.y - 1) / blockDim.y));
             switch (src1->type) {
                 case GGML_TYPE_F32:
-                    sinq_scale_matrix_cols_kernel<<<gridDim, blockDim, 0, ctx.stream()>>>(
+                    sinq_scale_matrix_cols_kernel<<<gridDim, blockDim, 0, sinq_stream>>>(
                             static_cast<float *>(src1_tmp), col_dev, ncols, nrows);
                     break;
                 case GGML_TYPE_F16:
-                    sinq_scale_matrix_cols_kernel<<<gridDim, blockDim, 0, ctx.stream()>>>(
+                    sinq_scale_matrix_cols_kernel<<<gridDim, blockDim, 0, sinq_stream>>>(
                             static_cast<half *>(src1_tmp), col_dev, ncols, nrows);
                     break;
                 case GGML_TYPE_BF16:
-                    sinq_scale_matrix_cols_kernel<<<gridDim, blockDim, 0, ctx.stream()>>>(
+                    sinq_scale_matrix_cols_kernel<<<gridDim, blockDim, 0, sinq_stream>>>(
                             static_cast<nv_bfloat16 *>(src1_tmp), col_dev, ncols, nrows);
                     break;
                 default:
@@ -2410,7 +2436,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             }
 
             src1_compute = &src1_sinq;
-        }
+        });
     }
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
@@ -2518,41 +2544,43 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
 
     if (apply_sinq_row) {
-        // Apply the per-output scaling after the matrix multiply, mirroring Eq. (6)
-        // of the SINQ paper (https://arxiv.org/abs/2509.22944).
-        float * row_dev = sinq_row_dev.alloc(sinq_pool, sinq_row->size());
-        CUDA_CHECK(sinq_cuda_memcpy_h2d(row_dev, sinq_row->data(), sinq_row->size(), ctx.stream()));
+        with_sinq_device([&](cudaStream_t sinq_stream) {
+            // Apply the per-output scaling after the matrix multiply, mirroring Eq. (6)
+            // of the SINQ paper (https://arxiv.org/abs/2509.22944).
+            float * row_dev = sinq_row_dev.alloc(sinq_pool, sinq_row->size());
+            CUDA_CHECK(sinq_cuda_memcpy_h2d(row_dev, sinq_row->data(), sinq_row->size(), sinq_stream));
 
-        const int64_t ncols_dst = dst->ne[0];
-        const int64_t nrows_dst = ggml_nrows(dst);
-        dim3 blockDim(32, 32);
-        dim3 gridDim((unsigned) ((ncols_dst + blockDim.x - 1) / blockDim.x),
-                     (unsigned) ((nrows_dst + blockDim.y - 1) / blockDim.y));
-        switch (dst->type) {
-            case GGML_TYPE_F32:
-                sinq_scale_matrix_rows_kernel<<<gridDim, blockDim, 0, ctx.stream()>>>(
-                        static_cast<float *>(dst->data), row_dev, ncols_dst, nrows_dst);
-                break;
-            case GGML_TYPE_F16:
-                sinq_scale_matrix_rows_kernel<<<gridDim, blockDim, 0, ctx.stream()>>>(
-                        static_cast<half *>(dst->data), row_dev, ncols_dst, nrows_dst);
-                break;
-            case GGML_TYPE_BF16:
-                sinq_scale_matrix_rows_kernel<<<gridDim, blockDim, 0, ctx.stream()>>>(
-                        static_cast<nv_bfloat16 *>(dst->data), row_dev, ncols_dst, nrows_dst);
-                break;
-            default:
-                GGML_ABORT("unexpected tensor type for sinq row scaling");
-        }
-        CUDA_CHECK(cudaGetLastError());
+            const int64_t ncols_dst = dst->ne[0];
+            const int64_t nrows_dst = ggml_nrows(dst);
+            dim3 blockDim(32, 32);
+            dim3 gridDim((unsigned) ((ncols_dst + blockDim.x - 1) / blockDim.x),
+                         (unsigned) ((nrows_dst + blockDim.y - 1) / blockDim.y));
+            switch (dst->type) {
+                case GGML_TYPE_F32:
+                    sinq_scale_matrix_rows_kernel<<<gridDim, blockDim, 0, sinq_stream>>>(
+                            static_cast<float *>(dst->data), row_dev, ncols_dst, nrows_dst);
+                    break;
+                case GGML_TYPE_F16:
+                    sinq_scale_matrix_rows_kernel<<<gridDim, blockDim, 0, sinq_stream>>>(
+                            static_cast<half *>(dst->data), row_dev, ncols_dst, nrows_dst);
+                    break;
+                case GGML_TYPE_BF16:
+                    sinq_scale_matrix_rows_kernel<<<gridDim, blockDim, 0, sinq_stream>>>(
+                            static_cast<nv_bfloat16 *>(dst->data), row_dev, ncols_dst, nrows_dst);
+                    break;
+                default:
+                    GGML_ABORT("unexpected tensor type for sinq row scaling");
+            }
+            CUDA_CHECK(cudaGetLastError());
 
-        if (sinq_debug) {
-            GGML_LOG_INFO(
-                "%s: tensor '%s' finished SINQ row scaling (grid = %u x %u, block = %u x %u)\n",
-                __func__, tensor_name,
-                (unsigned) gridDim.x, (unsigned) gridDim.y,
-                (unsigned) blockDim.x, (unsigned) blockDim.y);
-        }
+            if (sinq_debug) {
+                GGML_LOG_INFO(
+                    "%s: tensor '%s' finished SINQ row scaling (grid = %u x %u, block = %u x %u)\n",
+                    __func__, tensor_name,
+                    (unsigned) gridDim.x, (unsigned) gridDim.y,
+                    (unsigned) blockDim.x, (unsigned) blockDim.y);
+            }
+        });
     }
 }
 
