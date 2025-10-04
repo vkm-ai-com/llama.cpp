@@ -152,10 +152,12 @@ static cudaError_t sinq_cuda_memcpy_h2d(float * dst, const float * src, size_t c
     const size_t nbytes = count * sizeof(float);
 
     cudaError_t err = cudaMemcpyAsync(dst, src, nbytes, cudaMemcpyHostToDevice, stream);
-    if (err == cudaErrorInvalidValue || err == cudaErrorNotSupported) {
+    if (err != cudaSuccess) {
         // Some CUDA drivers (notably on Windows) reject asynchronous H2D copies
-        // from pageable host memory.  Fall back to a synchronous transfer so the
-        // model load continues instead of aborting during SINQ setup.
+        // from pageable host memory, returning errors such as cudaErrorNotSupported
+        // or cudaErrorInvalidValue.  Other environments can emit different error
+        // codes as well.  Fall back to a synchronous transfer so the model load
+        // continues instead of aborting during SINQ setup.
         (void) cudaGetLastError();
         err = cudaMemcpy(dst, src, nbytes, cudaMemcpyHostToDevice);
     }
