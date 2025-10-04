@@ -151,7 +151,7 @@ int main(int argc, char ** argv) {
 
     llama_model_quantize_params q_params = llama_model_quantize_default_params();
     q_params.nthread = 1;
-    q_params.ftype   = LLAMA_FTYPE_MOSTLY_Q4_0;
+    q_params.ftype   = LLAMA_FTYPE_ALL_F16;
     q_params.use_sinq = true;
 
     if (llama_model_quantize(model_path.c_str(), tmp_path.string().c_str(), &q_params) != 0) {
