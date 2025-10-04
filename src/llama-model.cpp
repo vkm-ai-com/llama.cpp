@@ -6277,11 +6277,22 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             continue;
         }
 
+        // NOTE:
+        // The CUDA backend has specialized kernels that can apply the SINQ preconditioning
+        // directly on the device by keeping a shadow copy of the per-row/column scales.
+        // Those kernels currently prevent llama-server from completing its warmup pass when
+        // loading SINQ-quantized models, so we temporarily fall back to the generic
+        // graph-level implementation (which multiplies by the cached scales explicitly).
+        // This keeps correctness and allows serving to continue, at the cost of an extra
+        // elementwise multiply on CUDA.  The CPU path is unaffected.
 #if defined(GGML_USE_CUDA)
-        ggml_backend_cuda_tensor_set_sinq(
-            tensor,
-            scales.row.empty() ? nullptr : scales.row.data(), (int64_t) scales.row.size(),
-            scales.col.empty() ? nullptr : scales.col.data(), (int64_t) scales.col.size());
+        constexpr bool kEnableCudaSinqBackend = false;
+        if (kEnableCudaSinqBackend) {
+            ggml_backend_cuda_tensor_set_sinq(
+                tensor,
+                scales.row.empty() ? nullptr : scales.row.data(), (int64_t) scales.row.size(),
+                scales.col.empty() ? nullptr : scales.col.data(), (int64_t) scales.col.size());
+        }
 #endif
 
         ++it;
