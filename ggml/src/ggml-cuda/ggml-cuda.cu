@@ -2120,6 +2120,21 @@ static void ggml_cuda_mul_mat_batched_cublas(ggml_backend_cuda_context & ctx, co
     }
 }
 
+static void ggml_cuda_tensor_clear_runtime_metadata(ggml_tensor & tensor) {
+    // Intentionally leave tensor.buffer untouched so callers can still inspect
+    // the original device placement.  Only the per-evaluation metadata that can
+    // cache stale device pointers is scrubbed here.
+    tensor.extra     = nullptr;
+    tensor.view_src  = nullptr;
+    tensor.view_offs = 0;
+    tensor.op        = GGML_OP_NONE;
+    std::fill(std::begin(tensor.op_params), std::end(tensor.op_params), 0);
+    tensor.flags     = 0;
+    for (auto & src_entry : tensor.src) {
+        src_entry = nullptr;
+    }
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
 
@@ -2202,19 +2217,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // in place can lead to helpers reading stale addresses that belong to the
     // weight buffer instead of our scratch allocation, which prevents the kernel
     // launches from ever executing and effectively stalls inference.
-    src1_sinq.extra     = nullptr;
-    // keep the original backend buffer (intentionally not cleared) so
-    // downstream CUDA helpers can inspect the tensor's device placement.
-    // only the data pointer is redirected to the temporary scratch
-    // allocation below.
-    src1_sinq.view_src  = nullptr;
-    src1_sinq.view_offs = 0;
-    src1_sinq.op        = GGML_OP_NONE;
-    std::fill(std::begin(src1_sinq.op_params), std::end(src1_sinq.op_params), 0);
-    src1_sinq.flags     = 0;
-    for (auto & src_entry : src1_sinq.src) {
-        src_entry = nullptr;
-    }
+    ggml_cuda_tensor_clear_runtime_metadata(src1_sinq);
     const ggml_tensor * src1_compute = src1;
     ggml_cuda_pool_alloc<float>       sinq_col_dev;
     ggml_cuda_pool_alloc<float>       sinq_row_dev;
