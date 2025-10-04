@@ -144,6 +144,25 @@ static const ggml_cuda_sinq_scales * ggml_cuda_get_sinq_scales(const ggml_tensor
     return nullptr;
 }
 
+static cudaError_t sinq_cuda_memcpy_h2d(float * dst, const float * src, size_t count, cudaStream_t stream) {
+    if (count == 0) {
+        return cudaSuccess;
+    }
+
+    const size_t nbytes = count * sizeof(float);
+
+    cudaError_t err = cudaMemcpyAsync(dst, src, nbytes, cudaMemcpyHostToDevice, stream);
+    if (err == cudaErrorInvalidValue || err == cudaErrorNotSupported) {
+        // Some CUDA drivers (notably on Windows) reject asynchronous H2D copies
+        // from pageable host memory.  Fall back to a synchronous transfer so the
+        // model load continues instead of aborting during SINQ setup.
+        (void) cudaGetLastError();
+        err = cudaMemcpy(dst, src, nbytes, cudaMemcpyHostToDevice);
+    }
+
+    return err;
+}
+
 template <typename T>
 static __device__ inline float sinq_scale_to_float(T value) {
     return value;
@@ -2334,9 +2353,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             }
 
             float * col_dev = sinq_col_dev.alloc(sinq_pool, sinq_col->size());
-            CUDA_CHECK(cudaMemcpyAsync(col_dev, sinq_col->data(),
-                                       sinq_col->size()*sizeof(float),
-                                       cudaMemcpyHostToDevice, ctx.stream()));
+            CUDA_CHECK(sinq_cuda_memcpy_h2d(col_dev, sinq_col->data(), sinq_col->size(), ctx.stream()));
 
             const int64_t ncols = src1->ne[0];
             const int64_t nrows = ggml_nrows(src1);
@@ -2482,9 +2499,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         // Apply the per-output scaling after the matrix multiply, mirroring Eq. (6)
         // of the SINQ paper (https://arxiv.org/abs/2509.22944).
         float * row_dev = sinq_row_dev.alloc(sinq_pool, sinq_row->size());
-        CUDA_CHECK(cudaMemcpyAsync(row_dev, sinq_row->data(),
-                                   sinq_row->size()*sizeof(float),
-                                   cudaMemcpyHostToDevice, ctx.stream()));
+        CUDA_CHECK(sinq_cuda_memcpy_h2d(row_dev, sinq_row->data(), sinq_row->size(), ctx.stream()));
 
         const int64_t ncols_dst = dst->ne[0];
         const int64_t nrows_dst = ggml_nrows(dst);
