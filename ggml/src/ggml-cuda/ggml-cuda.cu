@@ -2,6 +2,8 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#include <cstring>
+
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
@@ -2208,7 +2210,17 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 #endif
     }
 
-    ggml_tensor src1_sinq = *src1;
+    ggml_tensor src1_sinq;
+    std::memset(&src1_sinq, 0, sizeof(src1_sinq));
+    src1_sinq.type   = src1->type;
+    src1_sinq.buffer = src1->buffer;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        src1_sinq.ne[i] = src1->ne[i];
+        src1_sinq.nb[i] = src1->nb[i];
+    }
+    if (src1->name[0] != '\0') {
+        std::memcpy(src1_sinq.name, src1->name, sizeof(src1_sinq.name));
+    }
     // src1_sinq is a temporary tensor that uses a scratch buffer to hold the
     // column-scaled activations.  Any backend metadata associated with the
     // original tensor (buffer handles, extra CUDA bookkeeping, graph links,
