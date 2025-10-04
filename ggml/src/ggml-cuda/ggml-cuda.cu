@@ -58,6 +58,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstring>
 #include <charconv>
 #include <cinttypes>
 #include <condition_variable>
@@ -2213,7 +2214,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 #endif
     }
 
-    ggml_tensor src1_sinq = *src1;
+    ggml_tensor src1_sinq = {};
+    src1_sinq.type   = src1->type;
+    src1_sinq.buffer = src1->buffer;
+    memcpy(src1_sinq.ne, src1->ne, sizeof(src1_sinq.ne));
+    memcpy(src1_sinq.nb, src1->nb, sizeof(src1_sinq.nb));
+    src1_sinq.data = src1->data;
+    memcpy(src1_sinq.name, src1->name, sizeof(src1_sinq.name));
     // src1_sinq is a temporary tensor that uses a scratch buffer to hold the
     // column-scaled activations.  Any backend metadata associated with the
     // original tensor (buffer handles, extra CUDA bookkeeping, graph links,
