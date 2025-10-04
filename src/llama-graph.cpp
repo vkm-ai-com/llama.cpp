@@ -642,6 +642,11 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     return res;
 }
 
+ggml_tensor * llm_graph_context::get_rows_with_sinq(ggml_tensor * tensor, ggml_tensor * ids) const {
+    return model_ptr ? model_ptr->get_rows_with_sinq(ctx0, tensor, ids)
+                     : ggml_get_rows(ctx0, tensor, ids);
+}
+
 ggml_tensor * llm_graph_context::build_norm(
          ggml_tensor * cur,
          ggml_tensor * mw,
@@ -1101,7 +1106,7 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
         ggml_set_input(inp->tokens);
         res->t_tokens = inp->tokens;
 
-        cur = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+        cur = get_rows_with_sinq(tok_embd, inp->tokens);
 
         // apply lora for embedding tokens if needed
         for (const auto & lora : *loras) {

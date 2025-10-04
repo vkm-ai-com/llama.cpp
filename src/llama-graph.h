@@ -613,6 +613,8 @@ struct llm_graph_context {
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids) const;
 
+    ggml_tensor * get_rows_with_sinq(ggml_tensor * tensor, ggml_tensor * ids) const;
+
     ggml_tensor * build_norm(
              ggml_tensor * cur,
              ggml_tensor * mw,
