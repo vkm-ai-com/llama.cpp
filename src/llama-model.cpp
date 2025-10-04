@@ -380,6 +380,10 @@ ggml_tensor * llama_model::mul_mat_with_sinq(ggml_context * ctx, ggml_tensor * w
         return ggml_mul_mat(ctx, weight, input);
     }
 
+    const char * log_name = !scales->source_name.empty()
+        ? scales->source_name.c_str()
+        : (weight_name != nullptr ? weight_name : "<unnamed>");
+
 #if defined(GGML_USE_CUDA)
     bool use_cuda_backend = false;
     if (pimpl->cuda_sinq_backend_enabled && weight->buffer != nullptr && !ggml_backend_buffer_is_host(weight->buffer)) {
@@ -410,10 +414,9 @@ ggml_tensor * llama_model::mul_mat_with_sinq(ggml_context * ctx, ggml_tensor * w
         if (matches_transposed) {
             std::swap(col_scales, row_scales);
         } else {
-            const char * name = weight_name != nullptr ? weight_name : "<unnamed>";
             LLAMA_LOG_WARN(
                 "%s: ignoring SINQ scales for tensor '%s' due to shape mismatch (col = %zu, row = %zu, expected %lld x %lld or %lld x %lld)\n",
-                __func__, name,
+                __func__, log_name,
                 col_scales->size(), row_scales->size(),
                 (long long) weight->ne[0], (long long) weight->ne[1],
                 (long long) weight->ne[1], (long long) weight->ne[0]);
@@ -452,6 +455,10 @@ ggml_tensor * llama_model::mul_mat_id_with_sinq(ggml_context * ctx, ggml_tensor 
         return ggml_mul_mat_id(ctx, weight, input, ids);
     }
 
+    const char * log_name = !scales->source_name.empty()
+        ? scales->source_name.c_str()
+        : (weight_name != nullptr ? weight_name : "<unnamed>");
+
 #if defined(GGML_USE_CUDA)
     bool use_cuda_backend = false;
     if (pimpl->cuda_sinq_backend_enabled && weight->buffer != nullptr && !ggml_backend_buffer_is_host(weight->buffer)) {
@@ -482,10 +489,9 @@ ggml_tensor * llama_model::mul_mat_id_with_sinq(ggml_context * ctx, ggml_tensor 
         if (matches_transposed) {
             std::swap(col_scales, row_scales);
         } else {
-            const char * name = weight_name != nullptr ? weight_name : "<unnamed>";
             LLAMA_LOG_WARN(
                 "%s: ignoring SINQ scales for tensor '%s' due to shape mismatch (col = %zu, row = %zu, expected %lld x %lld or %lld x %lld)\n",
-                __func__, name,
+                __func__, log_name,
                 col_scales->size(), row_scales->size(),
                 (long long) weight->ne[0], (long long) weight->ne[1],
                 (long long) weight->ne[1], (long long) weight->ne[0]);
@@ -6276,16 +6282,30 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         scales.row = std::move(row_scale);
         scales.col = std::move(col_scale);
         ml.get_key(tensor_name + ".sinq.imbalance", scales.imbalance, false);
-        pimpl->sinq_by_name.emplace(tensor_name, std::move(scales));
+        scales.source_name = tensor_name;
+
+        std::string truncated_name = tensor_name;
+        if (truncated_name.size() >= GGML_MAX_NAME) {
+            truncated_name.resize(GGML_MAX_NAME - 1);
+        }
+
+        auto inserted = pimpl->sinq_by_name.emplace(truncated_name, std::move(scales));
+        if (!inserted.second) {
+            LLAMA_LOG_WARN(
+                "%s: duplicate SINQ metadata for tensor '%s' truncated to '%s', keeping existing entry\n",
+                __func__, tensor_name.c_str(), truncated_name.c_str());
+        }
     }
 
     for (auto it = pimpl->sinq_by_name.begin(); it != pimpl->sinq_by_name.end(); ) {
         const std::string & tensor_name = it->first;
         auto & scales = it->second;
 
+        const std::string & log_name = !scales.source_name.empty() ? scales.source_name : tensor_name;
+
         const auto * tensor = get_tensor(tensor_name.c_str());
         if (tensor == nullptr) {
-            LLAMA_LOG_WARN("%s: unable to find tensor '%s' for SINQ scaling, disabling\n", __func__, tensor_name.c_str());
+            LLAMA_LOG_WARN("%s: unable to find tensor '%s' for SINQ scaling, disabling\n", __func__, log_name.c_str());
             it = pimpl->sinq_by_name.erase(it);
             continue;
         }
@@ -6307,12 +6327,12 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             if (matches_transposed) {
                 LLAMA_LOG_DEBUG(
                     "%s: swapping SINQ scales for tensor '%s' to match transposed layout\n",
-                    __func__, tensor_name.c_str());
+                    __func__, log_name.c_str());
                 std::swap(scales.row, scales.col);
             } else if (!scales.col.empty() || !scales.row.empty()) {
                 LLAMA_LOG_WARN(
                     "%s: ignoring SINQ scales for tensor '%s' due to shape mismatch (col = %zu, row = %zu, expected %lld x %lld or %lld x %lld)\n",
-                    __func__, tensor_name.c_str(), col_size, row_size,
+                    __func__, log_name.c_str(), col_size, row_size,
                     (long long) tensor_cols, (long long) tensor_rows,
                     (long long) tensor_rows, (long long) tensor_cols);
                 it = pimpl->sinq_by_name.erase(it);
