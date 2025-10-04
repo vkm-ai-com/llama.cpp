@@ -361,8 +361,8 @@ extern "C" {
         bool keep_split;                      // quantize to the same number of shards
         bool use_sinq;                        // enable Sinkhorn-Normalized Quantization preconditioning
         int32_t sinq_iterations;              // number of Sinkhorn normalization iterations
-        float sinq_min_std;                   // minimum allowed standard deviation during normalization
-        float sinq_max_log_delta;             // clamp on log-scale updates per iteration
+        float sinq_min_std;                   // minimum clamp applied to per-axis standard deviations during normalization
+        float sinq_max_log_delta;             // deprecated compatibility field (unused)
         void * imatrix;                       // pointer to importance matrix data
         void * kv_overrides;                  // pointer to vector containing overrides
         void * tensor_types;                  // pointer to vector containing tensor types
