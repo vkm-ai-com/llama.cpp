@@ -124,17 +124,23 @@ GGML_API void ggml_backend_cuda_tensor_clear_sinq(const struct ggml_tensor * ten
 }
 
 static const ggml_cuda_sinq_scales * ggml_cuda_get_sinq_scales(const ggml_tensor * tensor) {
-    if (tensor == nullptr) {
-        return nullptr;
-    }
-
     std::lock_guard<std::mutex> guard(g_sinq_mutex);
-    auto it = g_sinq_scales.find(tensor);
-    if (it == g_sinq_scales.end()) {
-        return nullptr;
+
+    // When ggml builds helper views (e.g. during MoE expert dispatch) the
+    // resulting tensors keep a pointer to the original weight via view_src.
+    // The SINQ metadata is registered for the canonical weight tensor, so we
+    // need to walk the view chain to find the associated scales.
+    const ggml_tensor * current = tensor;
+    while (current != nullptr) {
+        auto it = g_sinq_scales.find(current);
+        if (it != g_sinq_scales.end()) {
+            return &it->second;
+        }
+
+        current = current->view_src;
     }
 
-    return &it->second;
+    return nullptr;
 }
 
 template <typename T>
