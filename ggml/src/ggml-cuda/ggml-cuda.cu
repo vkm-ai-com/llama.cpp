@@ -2195,6 +2195,17 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 #endif
     }
 
+    struct sinq_tensor_extra_guard {
+        ggml_tensor * tensor = nullptr;
+
+        ~sinq_tensor_extra_guard() {
+            if (tensor != nullptr) {
+                delete static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
+                tensor->extra = nullptr;
+            }
+        }
+    } src1_sinq_extra_guard;
+
     ggml_tensor src1_sinq;
     std::memset(&src1_sinq, 0, sizeof(src1_sinq));
     src1_sinq.type   = src1->type;
@@ -2223,7 +2234,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     src1_sinq.view_offs = 0;
     src1_sinq.op        = GGML_OP_NONE;
     std::fill(std::begin(src1_sinq.op_params), std::end(src1_sinq.op_params), 0);
-    src1_sinq.flags     = 0;
+    src1_sinq.flags     = src1->flags;
     for (auto & src_entry : src1_sinq.src) {
         src_entry = nullptr;
     }
@@ -2261,6 +2272,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             src1_sinq.nb[1]  = src1_sinq.nb[0] * src1_sinq.ne[0];
             src1_sinq.nb[2]  = src1_sinq.nb[1] * src1_sinq.ne[1];
             src1_sinq.nb[3]  = src1_sinq.nb[2] * src1_sinq.ne[2];
+
+            auto * extra_gpu = new ggml_tensor_extra_gpu{};
+            extra_gpu->data_device[ctx.device] = src1_tmp;
+            src1_sinq.extra = extra_gpu;
+            src1_sinq_extra_guard.tensor = &src1_sinq;
 
             // Disable copy indirection here because this temporary tensor is not a
             // persistent graph node.  Otherwise CUDA graph capture would assume an
