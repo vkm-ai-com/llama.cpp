@@ -424,6 +424,8 @@ ggml_tensor * llama_model::mul_mat_with_sinq(ggml_context * ctx, ggml_tensor * w
         }
     }
 
+    const char * base_weight_name = weight_name != nullptr ? weight_name : log_name;
+
     ggml_tensor * scaled_input = input;
     if (!col_scales->empty()) {
         ggml_tensor * col = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, col_scales->size());
@@ -432,7 +434,7 @@ ggml_tensor * llama_model::mul_mat_with_sinq(ggml_context * ctx, ggml_tensor * w
         } else {
             col->data = const_cast<float *>(col_scales->data());
         }
-        std::string col_name = std::string(weight_name) + ".sinq_col";
+        std::string col_name = std::string(base_weight_name) + ".sinq_col";
         ggml_set_name(col, col_name.c_str());
         scaled_input = ggml_mul(ctx, scaled_input, ggml_repeat(ctx, col, scaled_input));
     }
@@ -448,7 +450,7 @@ ggml_tensor * llama_model::mul_mat_with_sinq(ggml_context * ctx, ggml_tensor * w
         } else {
             row->data = const_cast<float *>(row_scales->data());
         }
-        std::string row_name = std::string(weight_name) + ".sinq_row";
+        std::string row_name = std::string(base_weight_name) + ".sinq_row";
         ggml_set_name(row, row_name.c_str());
         result = ggml_mul(ctx, result, ggml_repeat(ctx, row, result));
     }
@@ -507,6 +509,8 @@ ggml_tensor * llama_model::mul_mat_id_with_sinq(ggml_context * ctx, ggml_tensor 
         }
     }
 
+    const char * base_weight_name = weight_name != nullptr ? weight_name : log_name;
+
     ggml_tensor * scaled_input = input;
     if (!col_scales->empty()) {
         ggml_tensor * col = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, col_scales->size());
@@ -515,7 +519,7 @@ ggml_tensor * llama_model::mul_mat_id_with_sinq(ggml_context * ctx, ggml_tensor 
         } else {
             col->data = const_cast<float *>(col_scales->data());
         }
-        std::string col_name = std::string(weight_name) + ".sinq_col";
+        std::string col_name = std::string(base_weight_name) + ".sinq_col";
         ggml_set_name(col, col_name.c_str());
         scaled_input = ggml_mul(ctx, scaled_input, ggml_repeat(ctx, col, scaled_input));
     }
@@ -532,7 +536,7 @@ ggml_tensor * llama_model::mul_mat_id_with_sinq(ggml_context * ctx, ggml_tensor 
         } else {
             row->data = const_cast<float *>(row_scales->data());
         }
-        std::string row_name = std::string(weight_name) + ".sinq_row";
+        std::string row_name = std::string(base_weight_name) + ".sinq_row";
         ggml_set_name(row, row_name.c_str());
         result = ggml_mul(ctx, result, ggml_repeat(ctx, row, result));
     }
