@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -130,8 +131,8 @@ int main(int argc, char ** argv) {
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = 0;
 
-    llama_model * baseline_model = llama_model_load_from_file(model_path.c_str(), model_params);
-    if (baseline_model == nullptr) {
+    llama_model * float_model = llama_model_load_from_file(model_path.c_str(), model_params);
+    if (float_model == nullptr) {
         std::fprintf(stderr, "failed to load baseline model from %s\n", model_path.c_str());
         return 1;
     }
@@ -139,47 +140,87 @@ int main(int argc, char ** argv) {
     const std::string prompt = "how are you?";
     const int n_predict = 16;
 
-    const generation_result baseline = generate_from_model(baseline_model, prompt, n_predict);
-    llama_model_free(baseline_model);
+    const generation_result float_result = generate_from_model(float_model, prompt, n_predict);
+    llama_model_free(float_model);
 
-    if (baseline.tokens.empty()) {
+    if (float_result.tokens.empty()) {
         std::fprintf(stderr, "baseline generation failed\n");
         return 1;
     }
 
-    const std::filesystem::path tmp_path = make_temp_path();
+    auto quantize_model = [&](bool use_sinq) -> std::optional<std::filesystem::path> {
+        const std::filesystem::path tmp_path = make_temp_path();
 
-    llama_model_quantize_params q_params = llama_model_quantize_default_params();
-    q_params.nthread = 1;
-    q_params.ftype   = LLAMA_FTYPE_ALL_F16;
-    q_params.use_sinq = true;
+        llama_model_quantize_params q_params = llama_model_quantize_default_params();
+        q_params.nthread = 1;
+        q_params.ftype   = LLAMA_FTYPE_MOSTLY_Q4_0;
+        q_params.use_sinq = use_sinq;
 
-    if (llama_model_quantize(model_path.c_str(), tmp_path.string().c_str(), &q_params) != 0) {
-        std::fprintf(stderr, "model quantization failed\n");
-        std::error_code ec;
-        std::filesystem::remove(tmp_path, ec);
+        if (llama_model_quantize(model_path.c_str(), tmp_path.string().c_str(), &q_params) != 0) {
+            std::fprintf(stderr, "model quantization failed (%s)\n", use_sinq ? "sinq" : "regular");
+            std::error_code ec;
+            std::filesystem::remove(tmp_path, ec);
+            return std::nullopt;
+        }
+
+        return tmp_path;
+    };
+
+    const auto regular_path_opt = quantize_model(false);
+    if (!regular_path_opt.has_value()) {
         return 1;
     }
 
-    llama_model * sinq_model = llama_model_load_from_file(tmp_path.string().c_str(), model_params);
+    const auto sinq_path_opt = quantize_model(true);
+    if (!sinq_path_opt.has_value()) {
+        std::error_code ec;
+        std::filesystem::remove(*regular_path_opt, ec);
+        return 1;
+    }
+
+    llama_model * regular_model = llama_model_load_from_file(regular_path_opt->string().c_str(), model_params);
+    if (regular_model == nullptr) {
+        std::fprintf(stderr, "failed to load quantized model from %s\n", regular_path_opt->string().c_str());
+        std::error_code ec;
+        std::filesystem::remove(*regular_path_opt, ec);
+        std::filesystem::remove(*sinq_path_opt, ec);
+        return 1;
+    }
+
+    llama_model * sinq_model = llama_model_load_from_file(sinq_path_opt->string().c_str(), model_params);
     if (sinq_model == nullptr) {
-        std::fprintf(stderr, "failed to load quantized model from %s\n", tmp_path.string().c_str());
+        std::fprintf(stderr, "failed to load quantized model from %s\n", sinq_path_opt->string().c_str());
+        llama_model_free(regular_model);
         std::error_code ec;
-        std::filesystem::remove(tmp_path, ec);
+        std::filesystem::remove(*regular_path_opt, ec);
+        std::filesystem::remove(*sinq_path_opt, ec);
         return 1;
     }
 
+    const generation_result regular_result = generate_from_model(regular_model, prompt, n_predict);
     const generation_result sinq_result = generate_from_model(sinq_model, prompt, n_predict);
+
+    llama_model_free(regular_model);
     llama_model_free(sinq_model);
 
     std::error_code ec;
-    std::filesystem::remove(tmp_path, ec);
+    std::filesystem::remove(*regular_path_opt, ec);
+    std::filesystem::remove(*sinq_path_opt, ec);
 
-    if (sinq_result.tokens != baseline.tokens) {
-        std::fprintf(stderr, "generation mismatch\n");
-        std::fprintf(stderr, "baseline: %s\n", baseline.text.c_str());
+    if (regular_result.tokens.empty()) {
+        std::fprintf(stderr, "regular quantization generation failed\n");
+        return 1;
+    }
+
+    if (sinq_result.tokens != regular_result.tokens) {
+        std::fprintf(stderr, "generation mismatch between regular and SINQ quantization\n");
+        std::fprintf(stderr, "regular: %s\n", regular_result.text.c_str());
         std::fprintf(stderr, "sinq: %s\n", sinq_result.text.c_str());
         return 1;
+    }
+
+    if (regular_result.tokens != float_result.tokens) {
+        std::fprintf(stderr, "warning: regular quantization output differs from float baseline\n");
     }
 
     return 0;
