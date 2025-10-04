@@ -427,13 +427,16 @@ ggml_tensor * llama_model::mul_mat_with_sinq(ggml_context * ctx, ggml_tensor * w
     ggml_tensor * scaled_input = input;
     if (!col_scales->empty()) {
         ggml_tensor * col = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, col_scales->size());
-        if (col->data != nullptr) {
+        if (col->buffer != nullptr) {
+            ggml_backend_tensor_set(col, col_scales->data(), 0, col_scales->size() * sizeof(float));
+        } else if (col->data != nullptr) {
             std::memcpy(col->data, col_scales->data(), col_scales->size() * sizeof(float));
         } else {
             col->data = const_cast<float *>(col_scales->data());
         }
         std::string col_name = std::string(weight_name) + ".sinq_col";
         ggml_set_name(col, col_name.c_str());
+        ggml_set_input(col);
         scaled_input = ggml_mul(ctx, scaled_input, ggml_repeat(ctx, col, scaled_input));
     }
 
@@ -443,13 +446,16 @@ ggml_tensor * llama_model::mul_mat_with_sinq(ggml_context * ctx, ggml_tensor * w
 
     if (!row_scales->empty()) {
         ggml_tensor * row = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, row_scales->size());
-        if (row->data != nullptr) {
+        if (row->buffer != nullptr) {
+            ggml_backend_tensor_set(row, row_scales->data(), 0, row_scales->size() * sizeof(float));
+        } else if (row->data != nullptr) {
             std::memcpy(row->data, row_scales->data(), row_scales->size() * sizeof(float));
         } else {
             row->data = const_cast<float *>(row_scales->data());
         }
         std::string row_name = std::string(weight_name) + ".sinq_row";
         ggml_set_name(row, row_name.c_str());
+        ggml_set_input(row);
         result = ggml_mul(ctx, result, ggml_repeat(ctx, row, result));
     }
 
@@ -510,13 +516,16 @@ ggml_tensor * llama_model::mul_mat_id_with_sinq(ggml_context * ctx, ggml_tensor 
     ggml_tensor * scaled_input = input;
     if (!col_scales->empty()) {
         ggml_tensor * col = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, col_scales->size());
-        if (col->data != nullptr) {
+        if (col->buffer != nullptr) {
+            ggml_backend_tensor_set(col, col_scales->data(), 0, col_scales->size() * sizeof(float));
+        } else if (col->data != nullptr) {
             std::memcpy(col->data, col_scales->data(), col_scales->size() * sizeof(float));
         } else {
             col->data = const_cast<float *>(col_scales->data());
         }
         std::string col_name = std::string(weight_name) + ".sinq_col";
         ggml_set_name(col, col_name.c_str());
+        ggml_set_input(col);
         scaled_input = ggml_mul(ctx, scaled_input, ggml_repeat(ctx, col, scaled_input));
     }
 
@@ -527,13 +536,16 @@ ggml_tensor * llama_model::mul_mat_id_with_sinq(ggml_context * ctx, ggml_tensor 
 
     if (!row_scales->empty()) {
         ggml_tensor * row = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, row_scales->size());
-        if (row->data != nullptr) {
+        if (row->buffer != nullptr) {
+            ggml_backend_tensor_set(row, row_scales->data(), 0, row_scales->size() * sizeof(float));
+        } else if (row->data != nullptr) {
             std::memcpy(row->data, row_scales->data(), row_scales->size() * sizeof(float));
         } else {
             row->data = const_cast<float *>(row_scales->data());
         }
         std::string row_name = std::string(weight_name) + ".sinq_row";
         ggml_set_name(row, row_name.c_str());
+        ggml_set_input(row);
         result = ggml_mul(ctx, result, ggml_repeat(ctx, row, result));
     }
 
@@ -598,29 +610,36 @@ ggml_tensor * llama_model::get_rows_with_sinq(ggml_context * ctx, ggml_tensor * 
 
     if (!col_scales->empty()) {
         ggml_tensor * col = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, col_scales->size());
-        if (col->data != nullptr) {
+        if (col->buffer != nullptr) {
+            ggml_backend_tensor_set(col, col_scales->data(), 0, col_scales->size() * sizeof(float));
+        } else if (col->data != nullptr) {
             std::memcpy(col->data, col_scales->data(), col_scales->size() * sizeof(float));
         } else {
             col->data = const_cast<float *>(col_scales->data());
         }
         std::string col_name = base_name + ".sinq_col";
         ggml_set_name(col, col_name.c_str());
+        ggml_set_input(col);
         result = ggml_mul(ctx, result, ggml_repeat(ctx, col, result));
     }
 
     if (!row_scales->empty()) {
         ggml_tensor * row_table = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, row_scales->size());
-        if (row_table->data != nullptr) {
+        if (row_table->buffer != nullptr) {
+            ggml_backend_tensor_set(row_table, row_scales->data(), 0, row_scales->size() * sizeof(float));
+        } else if (row_table->data != nullptr) {
             std::memcpy(row_table->data, row_scales->data(), row_scales->size() * sizeof(float));
         } else {
             row_table->data = const_cast<float *>(row_scales->data());
         }
         std::string row_table_name = base_name + ".sinq_row_table";
         ggml_set_name(row_table, row_table_name.c_str());
+        ggml_set_input(row_table);
 
         ggml_tensor * row = ggml_get_rows(ctx, row_table, ids);
         std::string row_name = base_name + ".sinq_row";
         ggml_set_name(row, row_name.c_str());
+        ggml_set_input(row);
 
         result = ggml_mul(ctx, result, ggml_repeat(ctx, row, result));
     }
