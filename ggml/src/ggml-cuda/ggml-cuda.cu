@@ -1569,7 +1569,8 @@ static cudaError_t ggml_cuda_Memcpy2DPeerAsync(
 static void ggml_cuda_op_mul_mat(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, ggml_cuda_op_mul_mat_t op,
-    quantize_cuda_t quantize_src1) {
+    quantize_cuda_t quantize_src1,
+    const ggml_backend_cuda_buffer_context * src1_ctx_override) {
 
     const int64_t ne00 = src0->ne[0];
     const int64_t ne01 = src0->ne[1];
@@ -1593,8 +1594,11 @@ static void ggml_cuda_op_mul_mat(
     const int64_t nb2 = dst->nb[2];
     const int64_t nb3 = dst->nb[3];
 
-    ggml_backend_cuda_buffer_context * src1_ctx = (ggml_backend_cuda_buffer_context *) src1->buffer->context;
+    ggml_backend_cuda_buffer_context * src1_ctx = src1_ctx_override ? const_cast<ggml_backend_cuda_buffer_context *>(src1_ctx_override)
+                                                                    : (ggml_backend_cuda_buffer_context *) (src1->buffer ? src1->buffer->context : nullptr);
     ggml_backend_cuda_buffer_context * dst_ctx  = (ggml_backend_cuda_buffer_context *) dst->buffer->context;
+
+    GGML_ASSERT(src1_ctx != nullptr);
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32 || (src1->ne[2] == 1 && src1->ne[3] == 1));
 
@@ -2133,9 +2137,10 @@ static void ggml_cuda_mul_mat_batched_cublas(ggml_backend_cuda_context & ctx, co
 }
 
 static void ggml_cuda_tensor_clear_runtime_metadata(ggml_tensor & tensor) {
-    // Intentionally leave tensor.buffer untouched so callers can still inspect
-    // the original device placement.  Only the per-evaluation metadata that can
-    // cache stale device pointers is scrubbed here.
+    // Drop any backend bookkeeping that may cache stale device pointers from a
+    // source tensor.  The caller is responsible for preserving the device
+    // placement information separately when needed.
+    tensor.buffer    = nullptr;
     tensor.extra     = nullptr;
     tensor.view_src  = nullptr;
     tensor.view_offs = 0;
@@ -2220,9 +2225,15 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 #endif
     }
 
+    ggml_backend_buffer_t src1_buffer = src1->buffer;
+    ggml_backend_cuda_buffer_context * src1_ctx_override = nullptr;
+    if (src1_buffer != nullptr && ggml_backend_buffer_is_cuda(src1_buffer)) {
+        src1_ctx_override = (ggml_backend_cuda_buffer_context *) src1_buffer->context;
+        GGML_ASSERT(src1_ctx_override != nullptr);
+    }
+
     ggml_tensor src1_sinq = {};
     src1_sinq.type   = src1->type;
-    src1_sinq.buffer = src1->buffer;
     memcpy(src1_sinq.ne, src1->ne, sizeof(src1_sinq.ne));
     memcpy(src1_sinq.nb, src1->nb, sizeof(src1_sinq.nb));
     src1_sinq.data = src1->data;
@@ -2231,8 +2242,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // column-scaled activations.  Any backend metadata associated with the
     // original tensor (buffer handles, extra CUDA bookkeeping, graph links,
     // etc.) must be cleared so subsequent CUDA helpers interact only with the
-    // explicit device pointer we manage below.  Leaving the original metadata
-    // in place can lead to helpers reading stale addresses that belong to the
+    // explicit device pointer we manage below.  The original device placement is
+    // preserved separately via src1_ctx_override.  Leaving the old metadata in
+    // place can lead to helpers reading stale addresses that belong to the
     // weight buffer instead of our scratch allocation, which prevents the kernel
     // launches from ever executing and effectively stalls inference.
     ggml_cuda_tensor_clear_runtime_metadata(src1_sinq);
@@ -2244,12 +2256,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // device when tensor parallelism is enabled.  Fallback to the current
     // compute device if src1 is not backed by a CUDA buffer (e.g. host
     // offload).
-    int sinq_device = ctx.device;
-    if (src1->buffer != nullptr && ggml_backend_buffer_is_cuda(src1->buffer)) {
-        auto * src1_ctx = (ggml_backend_cuda_buffer_context *) src1->buffer->context;
-        GGML_ASSERT(src1_ctx != nullptr);
-        sinq_device = src1_ctx->device;
-    }
+    int sinq_device = src1_ctx_override != nullptr ? src1_ctx_override->device : ctx.device;
 
     ggml_cuda_pool & sinq_pool = ctx.pool(sinq_device);
 
@@ -2399,13 +2406,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         // general KQ + KQV multi-batch without FlashAttention
         ggml_cuda_mul_mat_batched_cublas(ctx, src0, src1_compute, dst);
     } else if (use_mul_mat_vec_f) {
-        ggml_cuda_op_mul_mat(ctx, src0, src1_compute, dst, ggml_cuda_op_mul_mat_vec_f, nullptr);
+        ggml_cuda_op_mul_mat(ctx, src0, src1_compute, dst, ggml_cuda_op_mul_mat_vec_f, nullptr, src1_ctx_override);
     } else if (use_mul_mat_vec_q) {
-        ggml_cuda_op_mul_mat(ctx, src0, src1_compute, dst, ggml_cuda_op_mul_mat_vec_q, quantize_row_q8_1_cuda);
+        ggml_cuda_op_mul_mat(ctx, src0, src1_compute, dst, ggml_cuda_op_mul_mat_vec_q, quantize_row_q8_1_cuda, src1_ctx_override);
     } else if (use_mul_mat_q) {
-        ggml_cuda_op_mul_mat(ctx, src0, src1_compute, dst, ggml_cuda_op_mul_mat_q, quantize_mmq_q8_1_cuda);
+        ggml_cuda_op_mul_mat(ctx, src0, src1_compute, dst, ggml_cuda_op_mul_mat_q, quantize_mmq_q8_1_cuda, src1_ctx_override);
     } else {
-        ggml_cuda_op_mul_mat(ctx, src0, src1_compute, dst, ggml_cuda_op_mul_mat_cublas, nullptr);
+        ggml_cuda_op_mul_mat(ctx, src0, src1_compute, dst, ggml_cuda_op_mul_mat_cublas, nullptr, src1_ctx_override);
     }
 
     if (apply_sinq_row) {
