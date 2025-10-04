@@ -151,8 +151,30 @@ static cudaError_t sinq_cuda_memcpy_h2d(float * dst, const float * src, size_t c
 
     const size_t nbytes = count * sizeof(float);
 
+    bool src_is_pinned = false;
+    cudaPointerAttributes attrs = {};
+    cudaError_t attr_err = cudaPointerGetAttributes(&attrs, src);
+    if (attr_err == cudaSuccess) {
+#if CUDART_VERSION >= 10000
+        src_is_pinned = attrs.type == cudaMemoryTypeHost;
+#else
+        src_is_pinned = attrs.memoryType == cudaMemoryTypeHost;
+#endif
+    } else {
+        // Queries against regular pageable memory return cudaErrorInvalidValue on
+        // some CUDA drivers (notably on Windows).  Clear the sticky error state so
+        // higher-level CUDA_CHECK macros don't treat it as a fatal failure.
+        (void) cudaGetLastError();
+    }
+
+    if (!src_is_pinned) {
+        // cudaMemcpyAsync() does not support pageable host memory.  Fall back to a
+        // synchronous transfer that works with regular std::vector-backed scales.
+        return cudaMemcpy(dst, src, nbytes, cudaMemcpyHostToDevice);
+    }
+
     cudaError_t err = cudaMemcpyAsync(dst, src, nbytes, cudaMemcpyHostToDevice, stream);
-    if (err == cudaErrorInvalidValue || err == cudaErrorNotSupported) {
+    if (err == cudaErrorInvalidValue || err == cudaErrorNotSupported || err == cudaErrorInvalidHostPointer) {
         // Some CUDA drivers (notably on Windows) reject asynchronous H2D copies
         // from pageable host memory.  Fall back to a synchronous transfer so the
         // model load continues instead of aborting during SINQ setup.
