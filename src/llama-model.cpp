@@ -375,14 +375,31 @@ static buft_list_t make_cpu_buft_list(const std::vector<ggml_backend_dev_t> & de
 
 ggml_tensor * llama_model::mul_mat_with_sinq(ggml_context * ctx, ggml_tensor * weight, ggml_tensor * input) const {
     const char * weight_name = ggml_get_name(weight);
-    const auto * scales = get_sinq_scales(weight_name);
+    const auto * scales = get_sinq_scales(weight);
     if (scales == nullptr || (scales->row.empty() && scales->col.empty())) {
         return ggml_mul_mat(ctx, weight, input);
     }
 
-    const char * log_name = !scales->source_name.empty()
-        ? scales->source_name.c_str()
-        : (weight_name != nullptr ? weight_name : "<unnamed>");
+    auto make_base_name = [&](const char * name) {
+        std::string base;
+        if (name != nullptr && name[0] != '\0') {
+            base = name;
+            if (base.size() >= 7 && base.compare(base.size() - 7, 7, " (view)") == 0) {
+                base.resize(base.size() - 7);
+            }
+        } else if (!scales->source_name.empty()) {
+            base = scales->source_name;
+        } else {
+            base = "<unnamed>";
+        }
+        if (base.size() >= GGML_MAX_NAME) {
+            base.resize(GGML_MAX_NAME - 1);
+        }
+        return base;
+    };
+
+    const std::string base_name = make_base_name(weight_name);
+    const std::string log_name = !scales->source_name.empty() ? scales->source_name : base_name;
 
 #if defined(GGML_USE_CUDA)
     bool use_cuda_backend = false;
@@ -416,7 +433,7 @@ ggml_tensor * llama_model::mul_mat_with_sinq(ggml_context * ctx, ggml_tensor * w
         } else {
             LLAMA_LOG_WARN(
                 "%s: ignoring SINQ scales for tensor '%s' due to shape mismatch (col = %zu, row = %zu, expected %lld x %lld or %lld x %lld)\n",
-                __func__, log_name,
+                __func__, log_name.c_str(),
                 col_scales->size(), row_scales->size(),
                 (long long) weight->ne[0], (long long) weight->ne[1],
                 (long long) weight->ne[1], (long long) weight->ne[0]);
@@ -432,7 +449,7 @@ ggml_tensor * llama_model::mul_mat_with_sinq(ggml_context * ctx, ggml_tensor * w
         } else {
             col->data = const_cast<float *>(col_scales->data());
         }
-        std::string col_name = std::string(weight_name) + ".sinq_col";
+        std::string col_name = base_name + ".sinq_col";
         ggml_set_name(col, col_name.c_str());
         scaled_input = ggml_mul(ctx, scaled_input, ggml_repeat(ctx, col, scaled_input));
     }
@@ -448,7 +465,7 @@ ggml_tensor * llama_model::mul_mat_with_sinq(ggml_context * ctx, ggml_tensor * w
         } else {
             row->data = const_cast<float *>(row_scales->data());
         }
-        std::string row_name = std::string(weight_name) + ".sinq_row";
+        std::string row_name = base_name + ".sinq_row";
         ggml_set_name(row, row_name.c_str());
         result = ggml_mul(ctx, result, ggml_repeat(ctx, row, result));
     }
@@ -458,14 +475,31 @@ ggml_tensor * llama_model::mul_mat_with_sinq(ggml_context * ctx, ggml_tensor * w
 
 ggml_tensor * llama_model::mul_mat_id_with_sinq(ggml_context * ctx, ggml_tensor * weight, ggml_tensor * input, ggml_tensor * ids) const {
     const char * weight_name = ggml_get_name(weight);
-    const auto * scales = get_sinq_scales(weight_name);
+    const auto * scales = get_sinq_scales(weight);
     if (scales == nullptr || (scales->row.empty() && scales->col.empty())) {
         return ggml_mul_mat_id(ctx, weight, input, ids);
     }
 
-    const char * log_name = !scales->source_name.empty()
-        ? scales->source_name.c_str()
-        : (weight_name != nullptr ? weight_name : "<unnamed>");
+    auto make_base_name = [&](const char * name) {
+        std::string base;
+        if (name != nullptr && name[0] != '\0') {
+            base = name;
+            if (base.size() >= 7 && base.compare(base.size() - 7, 7, " (view)") == 0) {
+                base.resize(base.size() - 7);
+            }
+        } else if (!scales->source_name.empty()) {
+            base = scales->source_name;
+        } else {
+            base = "<unnamed>";
+        }
+        if (base.size() >= GGML_MAX_NAME) {
+            base.resize(GGML_MAX_NAME - 1);
+        }
+        return base;
+    };
+
+    const std::string base_name = make_base_name(weight_name);
+    const std::string log_name = !scales->source_name.empty() ? scales->source_name : base_name;
 
 #if defined(GGML_USE_CUDA)
     bool use_cuda_backend = false;
@@ -499,7 +533,7 @@ ggml_tensor * llama_model::mul_mat_id_with_sinq(ggml_context * ctx, ggml_tensor 
         } else {
             LLAMA_LOG_WARN(
                 "%s: ignoring SINQ scales for tensor '%s' due to shape mismatch (col = %zu, row = %zu, expected %lld x %lld or %lld x %lld)\n",
-                __func__, log_name,
+                __func__, log_name.c_str(),
                 col_scales->size(), row_scales->size(),
                 (long long) weight->ne[0], (long long) weight->ne[1],
                 (long long) weight->ne[1], (long long) weight->ne[0]);
@@ -515,7 +549,7 @@ ggml_tensor * llama_model::mul_mat_id_with_sinq(ggml_context * ctx, ggml_tensor 
         } else {
             col->data = const_cast<float *>(col_scales->data());
         }
-        std::string col_name = std::string(weight_name) + ".sinq_col";
+        std::string col_name = base_name + ".sinq_col";
         ggml_set_name(col, col_name.c_str());
         scaled_input = ggml_mul(ctx, scaled_input, ggml_repeat(ctx, col, scaled_input));
     }
@@ -532,7 +566,7 @@ ggml_tensor * llama_model::mul_mat_id_with_sinq(ggml_context * ctx, ggml_tensor 
         } else {
             row->data = const_cast<float *>(row_scales->data());
         }
-        std::string row_name = std::string(weight_name) + ".sinq_row";
+        std::string row_name = base_name + ".sinq_row";
         ggml_set_name(row, row_name.c_str());
         result = ggml_mul(ctx, result, ggml_repeat(ctx, row, result));
     }
@@ -542,14 +576,31 @@ ggml_tensor * llama_model::mul_mat_id_with_sinq(ggml_context * ctx, ggml_tensor 
 
 ggml_tensor * llama_model::get_rows_with_sinq(ggml_context * ctx, ggml_tensor * weight, ggml_tensor * ids) const {
     const char * weight_name = ggml_get_name(weight);
-    const auto * scales = get_sinq_scales(weight_name);
+    const auto * scales = get_sinq_scales(weight);
     if (scales == nullptr || (scales->row.empty() && scales->col.empty())) {
         return ggml_get_rows(ctx, weight, ids);
     }
 
-    const char * log_name = !scales->source_name.empty()
-        ? scales->source_name.c_str()
-        : (weight_name != nullptr ? weight_name : "<unnamed>");
+    auto make_base_name = [&](const char * name) {
+        std::string base;
+        if (name != nullptr && name[0] != '\0') {
+            base = name;
+            if (base.size() >= 7 && base.compare(base.size() - 7, 7, " (view)") == 0) {
+                base.resize(base.size() - 7);
+            }
+        } else if (!scales->source_name.empty()) {
+            base = scales->source_name;
+        } else {
+            base = "<unnamed>";
+        }
+        if (base.size() >= GGML_MAX_NAME) {
+            base.resize(GGML_MAX_NAME - 1);
+        }
+        return base;
+    };
+
+    const std::string base_name = make_base_name(weight_name);
+    const std::string log_name = !scales->source_name.empty() ? scales->source_name : base_name;
 
 #if defined(GGML_USE_CUDA)
     bool use_cuda_backend = false;
@@ -583,7 +634,7 @@ ggml_tensor * llama_model::get_rows_with_sinq(ggml_context * ctx, ggml_tensor * 
         } else {
             LLAMA_LOG_WARN(
                 "%s: ignoring SINQ scales for tensor '%s' due to shape mismatch (col = %zu, row = %zu, expected %lld x %lld or %lld x %lld)\n",
-                __func__, log_name,
+                __func__, log_name.c_str(),
                 col_scales->size(), row_scales->size(),
                 (long long) weight->ne[0], (long long) weight->ne[1],
                 (long long) weight->ne[1], (long long) weight->ne[0]);
@@ -592,9 +643,6 @@ ggml_tensor * llama_model::get_rows_with_sinq(ggml_context * ctx, ggml_tensor * 
     }
 
     ggml_tensor * result = ggml_get_rows(ctx, weight, ids);
-
-    const char * base_weight_name = weight_name != nullptr ? weight_name : log_name;
-    std::string base_name(base_weight_name);
 
     if (!col_scales->empty()) {
         ggml_tensor * col = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, col_scales->size());
@@ -6760,6 +6808,23 @@ const llama_model::llama_sinq_scales * llama_model::get_sinq_scales(const std::s
         return nullptr;
     }
     return &it->second;
+}
+
+const llama_model::llama_sinq_scales * llama_model::get_sinq_scales(const ggml_tensor * tensor) const {
+    const ggml_tensor * current = tensor;
+    while (current != nullptr) {
+        const char * name = ggml_get_name(current);
+        if (name != nullptr && name[0] != '\0') {
+            auto it = pimpl->sinq_by_name.find(name);
+            if (it != pimpl->sinq_by_name.end()) {
+                return &it->second;
+            }
+        }
+
+        current = current->view_src;
+    }
+
+    return nullptr;
 }
 
 bool llama_model::has_sinq_scales() const {

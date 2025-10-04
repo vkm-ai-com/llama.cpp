@@ -496,6 +496,7 @@ struct llama_model {
     const llama_sinq_scales * get_sinq_scales(const char * tensor_name) const {
         return get_sinq_scales(std::string(tensor_name));
     }
+    const llama_sinq_scales * get_sinq_scales(const struct ggml_tensor * tensor) const;
 
     bool has_sinq_scales() const;
 #if defined(GGML_USE_CUDA)
