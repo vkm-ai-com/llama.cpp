@@ -2237,11 +2237,27 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // launches from ever executing and effectively stalls inference.
     ggml_cuda_tensor_clear_runtime_metadata(src1_sinq);
     const ggml_tensor * src1_compute = src1;
-    ggml_cuda_pool_alloc<float>       sinq_col_dev;
-    ggml_cuda_pool_alloc<float>       sinq_row_dev;
-    ggml_cuda_pool_alloc<float>       sinq_src1_dev_f32;
-    ggml_cuda_pool_alloc<half>        sinq_src1_dev_f16;
-    ggml_cuda_pool_alloc<nv_bfloat16> sinq_src1_dev_bf16;
+    // Temporary SINQ buffers must be allocated on the same device as the
+    // activations they replace so that peer copies and device-specific helpers
+    // (e.g. CUDA events) continue to operate correctly.  Using the context's
+    // default pool is not sufficient because src1 may reside on a different
+    // device when tensor parallelism is enabled.  Fallback to the current
+    // compute device if src1 is not backed by a CUDA buffer (e.g. host
+    // offload).
+    int sinq_device = ctx.device;
+    if (src1->buffer != nullptr && ggml_backend_buffer_is_cuda(src1->buffer)) {
+        auto * src1_ctx = (ggml_backend_cuda_buffer_context *) src1->buffer->context;
+        GGML_ASSERT(src1_ctx != nullptr);
+        sinq_device = src1_ctx->device;
+    }
+
+    ggml_cuda_pool & sinq_pool = ctx.pool(sinq_device);
+
+    ggml_cuda_pool_alloc<float>       sinq_col_dev(sinq_pool);
+    ggml_cuda_pool_alloc<float>       sinq_row_dev(sinq_pool);
+    ggml_cuda_pool_alloc<float>       sinq_src1_dev_f32(sinq_pool);
+    ggml_cuda_pool_alloc<half>        sinq_src1_dev_f16(sinq_pool);
+    ggml_cuda_pool_alloc<nv_bfloat16> sinq_src1_dev_bf16(sinq_pool);
 
     if (apply_sinq_col) {
         const int64_t nelements_src1 = ggml_nelements(src1);
@@ -2249,13 +2265,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         void * src1_tmp = nullptr;
         switch (src1->type) {
             case GGML_TYPE_F32:
-                src1_tmp = sinq_src1_dev_f32.alloc(ctx.pool(), nelements_src1);
+                src1_tmp = sinq_src1_dev_f32.alloc(sinq_pool, nelements_src1);
                 break;
             case GGML_TYPE_F16:
-                src1_tmp = sinq_src1_dev_f16.alloc(ctx.pool(), nelements_src1);
+                src1_tmp = sinq_src1_dev_f16.alloc(sinq_pool, nelements_src1);
                 break;
             case GGML_TYPE_BF16:
-                src1_tmp = sinq_src1_dev_bf16.alloc(ctx.pool(), nelements_src1);
+                src1_tmp = sinq_src1_dev_bf16.alloc(sinq_pool, nelements_src1);
                 break;
             default:
                 GGML_LOG_WARN(
@@ -2278,7 +2294,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             // server warmup decode), effectively stalling execution.
             ggml_cuda_cpy(ctx, src1, &src1_sinq, /*disable_indirection_for_this_node=*/true);
 
-            float * col_dev = sinq_col_dev.alloc(ctx.pool(), sinq_col->size());
+            float * col_dev = sinq_col_dev.alloc(sinq_pool, sinq_col->size());
             CUDA_CHECK(cudaMemcpyAsync(col_dev, sinq_col->data(),
                                        sinq_col->size()*sizeof(float),
                                        cudaMemcpyHostToDevice, ctx.stream()));
@@ -2410,7 +2426,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (apply_sinq_row) {
         // Apply the per-output scaling after the matrix multiply, mirroring Eq. (6)
         // of the SINQ paper (https://arxiv.org/abs/2509.22944).
-        float * row_dev = sinq_row_dev.alloc(ctx.pool(), sinq_row->size());
+        float * row_dev = sinq_row_dev.alloc(sinq_pool, sinq_row->size());
         CUDA_CHECK(cudaMemcpyAsync(row_dev, sinq_row->data(),
                                    sinq_row->size()*sizeof(float),
                                    cudaMemcpyHostToDevice, ctx.stream()));
