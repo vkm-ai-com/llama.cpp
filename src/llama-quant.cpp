@@ -1305,6 +1305,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             const int64_t chunk_size = (n_per_row >= min_chunk_size ? n_per_row : n_per_row * ((min_chunk_size + n_per_row - 1)/n_per_row));
 
             const int64_t nelements_matrix = tensor->ne[0] * tensor->ne[1];
+            const int64_t nelements_total  = nelements_matrix * tensor->ne[2];
             const int64_t nchunk = (nelements_matrix + chunk_size - 1)/chunk_size;
             const int64_t nthread_use = nthread > 1 ? std::max((int64_t)1, std::min((int64_t)nthread, nchunk)) : 1;
 
@@ -1314,7 +1315,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
             if (maybe_sinq) {
                 try {
-                    sinq_buffer.assign(f32_data, f32_data + nelements_matrix);
+                    sinq_buffer.assign(f32_data, f32_data + nelements_total);
                     sinq_applied = llama_tensor_apply_sinq(*params, name, f32_data, sinq_buffer, nrows, n_per_row, sinq_row_scale, sinq_col_scale, sinq_imbalance);
                 } catch (const std::exception & e) {
                     LLAMA_LOG_WARN("%s: failed SINQ normalization for %s: %s\n", __func__, name.c_str(), e.what());
@@ -1329,8 +1330,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             new_size = 0;
             for (int64_t i03 = 0; i03 < tensor->ne[2]; ++i03) {
                 const float * f32_data_03 = f32_data + i03 * nelements_matrix;
-                if (sinq_applied && i03 == 0) {
-                    f32_data_03 = sinq_buffer.data();
+                if (sinq_applied) {
+                    f32_data_03 = sinq_buffer.data() + i03 * nelements_matrix;
                 }
                 void * new_data_03 = (char *)new_data + ggml_row_size(new_type, n_per_row) * i03 * nrows;
                 const float * imatrix_03 = imatrix ? imatrix + i03 * n_per_row : nullptr;
