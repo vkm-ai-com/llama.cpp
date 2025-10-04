@@ -61,6 +61,7 @@
 #include <cstring>
 #include <charconv>
 #include <cinttypes>
+#include <cstdlib>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -2136,6 +2137,22 @@ static void ggml_cuda_mul_mat_batched_cublas(ggml_backend_cuda_context & ctx, co
     }
 }
 
+static bool ggml_cuda_sinq_debug_enabled() {
+    static bool initialized = false;
+    static bool enabled = false;
+
+    if (!initialized) {
+        initialized = true;
+        const char * env = std::getenv("LLAMA_SINQ_DEBUG");
+        enabled = env != nullptr && env[0] != '\0' && env[0] != '0';
+        if (enabled) {
+            GGML_LOG_INFO("%s: LLAMA_SINQ_DEBUG enabled, emitting additional SINQ diagnostics\n", __func__);
+        }
+    }
+
+    return enabled;
+}
+
 static void ggml_cuda_tensor_clear_runtime_metadata(ggml_tensor & tensor) {
     // Drop any backend bookkeeping that may cache stale device pointers from a
     // source tensor.  The caller is responsible for preserving the device
@@ -2232,6 +2249,8 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         GGML_ASSERT(src1_ctx_override != nullptr);
     }
 
+    const bool sinq_debug = ggml_cuda_sinq_debug_enabled();
+
     ggml_tensor src1_sinq = {};
     src1_sinq.type   = src1->type;
     memcpy(src1_sinq.ne, src1->ne, sizeof(src1_sinq.ne));
@@ -2265,6 +2284,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     ggml_cuda_pool_alloc<float>       sinq_src1_dev_f32(sinq_pool);
     ggml_cuda_pool_alloc<half>        sinq_src1_dev_f16(sinq_pool);
     ggml_cuda_pool_alloc<nv_bfloat16> sinq_src1_dev_bf16(sinq_pool);
+
+    if (sinq_debug && (apply_sinq_col || apply_sinq_row)) {
+        GGML_LOG_INFO(
+            "%s: tensor '%s' launching SINQ path (device = %d, apply_col = %d, apply_row = %d, src1_type = %s, dst_type = %s)\n",
+            __func__, tensor_name, sinq_device, (int) apply_sinq_col, (int) apply_sinq_row,
+            ggml_type_name(src1->type), ggml_type_name(dst->type));
+    }
 
     if (apply_sinq_col) {
         const int64_t nelements_src1 = ggml_nelements(src1);
@@ -2301,6 +2327,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             // server warmup decode), effectively stalling execution.
             ggml_cuda_cpy(ctx, src1, &src1_sinq, /*disable_indirection_for_this_node=*/true);
 
+            if (sinq_debug) {
+                GGML_LOG_INFO(
+                    "%s: tensor '%s' copied activations to SINQ scratch buffer (%lld elements)\n",
+                    __func__, tensor_name, (long long) nelements_src1);
+            }
+
             float * col_dev = sinq_col_dev.alloc(sinq_pool, sinq_col->size());
             CUDA_CHECK(cudaMemcpyAsync(col_dev, sinq_col->data(),
                                        sinq_col->size()*sizeof(float),
@@ -2329,6 +2361,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
                     GGML_ABORT("unexpected tensor type for sinq column scaling");
             }
             CUDA_CHECK(cudaGetLastError());
+
+            if (sinq_debug) {
+                GGML_LOG_INFO(
+                    "%s: tensor '%s' finished SINQ column scaling (grid = %u x %u, block = %u x %u)\n",
+                    __func__, tensor_name,
+                    (unsigned) gridDim.x, (unsigned) gridDim.y,
+                    (unsigned) blockDim.x, (unsigned) blockDim.y);
+            }
 
             src1_compute = &src1_sinq;
         }
@@ -2391,6 +2431,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     bool use_batched_cublas_bf16 = src0->type == GGML_TYPE_BF16 && bf16_mma_hardware_available(cc);
     bool use_batched_cublas_f32  = src0->type == GGML_TYPE_F32;
 
+    if (sinq_debug && (apply_sinq_col || apply_sinq_row)) {
+        GGML_LOG_INFO("%s: tensor '%s' dispatching matrix multiply (kernel path selected)\n", __func__, tensor_name);
+    }
+
     if (!split && use_mul_mat_vec_f) {
         // the custom F16 vector kernel can be used over batched cuBLAS GEMM
         // but this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
@@ -2413,6 +2457,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_op_mul_mat(ctx, src0, src1_compute, dst, ggml_cuda_op_mul_mat_q, quantize_mmq_q8_1_cuda, src1_ctx_override);
     } else {
         ggml_cuda_op_mul_mat(ctx, src0, src1_compute, dst, ggml_cuda_op_mul_mat_cublas, nullptr, src1_ctx_override);
+    }
+
+    if (sinq_debug && (apply_sinq_col || apply_sinq_row)) {
+        GGML_LOG_INFO("%s: tensor '%s' completed matrix multiply\n", __func__, tensor_name);
     }
 
     if (apply_sinq_row) {
@@ -2460,6 +2508,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
                 GGML_ABORT("unexpected tensor type for sinq row scaling");
         }
         CUDA_CHECK(cudaGetLastError());
+
+        if (sinq_debug) {
+            GGML_LOG_INFO(
+                "%s: tensor '%s' finished SINQ row scaling (grid = %u x %u, block = %u x %u)\n",
+                __func__, tensor_name,
+                (unsigned) gridDim.x, (unsigned) gridDim.y,
+                (unsigned) blockDim.x, (unsigned) blockDim.y);
+        }
     }
 }
 
