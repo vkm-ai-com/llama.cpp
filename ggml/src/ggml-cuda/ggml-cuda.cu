@@ -86,6 +86,11 @@ struct ggml_cuda_sinq_scales {
 static std::mutex g_sinq_mutex;
 static std::unordered_map<const ggml_tensor *, ggml_cuda_sinq_scales> g_sinq_scales;
 
+static bool ggml_cuda_has_sinq_scales() {
+    std::lock_guard<std::mutex> guard(g_sinq_mutex);
+    return !g_sinq_scales.empty();
+}
+
 GGML_API void ggml_backend_cuda_tensor_set_sinq(
         const struct ggml_tensor * tensor,
         const float * row_scale, int64_t row_len,
@@ -3455,6 +3460,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     // Objects required for CUDA Graph
     if (cuda_ctx->cuda_graph == nullptr) {
         cuda_ctx->cuda_graph.reset(new ggml_cuda_graph());
+    }
+
+    if (ggml_cuda_has_sinq_scales()) {
+        cuda_ctx->cuda_graph->disable_due_to_sinq_scaling = true;
     }
 
     bool use_cuda_graph = true;
