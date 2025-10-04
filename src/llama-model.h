@@ -408,6 +408,7 @@ struct llama_model {
         std::vector<float> row;
         std::vector<float> col;
         float imbalance = 1.0f;
+        std::string source_name;
     };
 
     // for classifier models
