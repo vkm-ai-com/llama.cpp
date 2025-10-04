@@ -185,6 +185,7 @@ llama_build_and_test(test-json-partial.cpp)
 llama_build_and_test(test-log.cpp)
 llama_build_and_test(test-regex-partial.cpp)
 llama_build_and_test(test-sinq-get-rows.cpp)
+llama_build_and_test(test-sinq-mul-mat.cpp)
 llama_build_and_test(test-sinq-inference.cpp)
 
 if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "s390x")
