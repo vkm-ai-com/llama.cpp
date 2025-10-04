@@ -689,6 +689,12 @@ void llama_context::set_warmup(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
     cparams.warmup = value;
+
+#if defined(GGML_USE_CUDA)
+    if (model.has_sinq_scales()) {
+        model.set_cuda_sinq_backend_enabled(!value);
+    }
+#endif
 }
 
 void llama_context::set_adapter_lora(

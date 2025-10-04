@@ -496,6 +496,12 @@ struct llama_model {
         return get_sinq_scales(std::string(tensor_name));
     }
 
+    bool has_sinq_scales() const;
+#if defined(GGML_USE_CUDA)
+    void set_cuda_sinq_backend_enabled(bool enabled) const;
+    bool cuda_sinq_backend_enabled() const;
+#endif
+
     ggml_tensor * mul_mat_with_sinq(ggml_context * ctx, ggml_tensor * weight, ggml_tensor * input) const;
     ggml_tensor * mul_mat_id_with_sinq(ggml_context * ctx, ggml_tensor * weight, ggml_tensor * input, ggml_tensor * ids) const;
 

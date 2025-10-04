@@ -11,6 +11,7 @@
 #include "llama-memory-hybrid.h"
 #include "llama-memory-recurrent.h"
 
+#include "ggml-backend.h"
 #include "ggml-cpp.h"
 #if defined(GGML_USE_CUDA)
 #include "ggml-cuda.h"
@@ -379,6 +380,22 @@ ggml_tensor * llama_model::mul_mat_with_sinq(ggml_context * ctx, ggml_tensor * w
         return ggml_mul_mat(ctx, weight, input);
     }
 
+#if defined(GGML_USE_CUDA)
+    bool use_cuda_backend = false;
+    if (pimpl->cuda_sinq_backend_enabled && weight->buffer != nullptr && !ggml_backend_buffer_is_host(weight->buffer)) {
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(weight->buffer);
+        if (buft != nullptr) {
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                use_cuda_backend = true;
+            }
+        }
+    }
+    if (use_cuda_backend) {
+        return ggml_mul_mat(ctx, weight, input);
+    }
+#endif
+
     const std::vector<float> * col_scales = &scales->col;
     const std::vector<float> * row_scales = &scales->row;
 
@@ -434,6 +451,22 @@ ggml_tensor * llama_model::mul_mat_id_with_sinq(ggml_context * ctx, ggml_tensor 
     if (scales == nullptr || (scales->row.empty() && scales->col.empty())) {
         return ggml_mul_mat_id(ctx, weight, input, ids);
     }
+
+#if defined(GGML_USE_CUDA)
+    bool use_cuda_backend = false;
+    if (pimpl->cuda_sinq_backend_enabled && weight->buffer != nullptr && !ggml_backend_buffer_is_host(weight->buffer)) {
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(weight->buffer);
+        if (buft != nullptr) {
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                use_cuda_backend = true;
+            }
+        }
+    }
+    if (use_cuda_backend) {
+        return ggml_mul_mat_id(ctx, weight, input, ids);
+    }
+#endif
 
     const std::vector<float> * col_scales = &scales->col;
     const std::vector<float> * row_scales = &scales->row;
@@ -555,6 +588,9 @@ struct llama_model::impl {
     bool has_tensor_overrides;
 
     std::unordered_map<std::string, llama_model::llama_sinq_scales> sinq_by_name;
+#if defined(GGML_USE_CUDA)
+    bool cuda_sinq_backend_enabled = true;
+#endif
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -6277,17 +6313,13 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             continue;
         }
 
-        // NOTE:
-        // The CUDA backend has specialized kernels that can apply the SINQ preconditioning
-        // directly on the device by keeping a shadow copy of the per-row/column scales.
-        // Those kernels currently prevent llama-server from completing its warmup pass when
-        // loading SINQ-quantized models, so we temporarily fall back to the generic
-        // graph-level implementation (which multiplies by the cached scales explicitly).
-        // This keeps correctness and allows serving to continue, at the cost of an extra
-        // elementwise multiply on CUDA.  The CPU path is unaffected.
+        // Register the per-axis scales with the CUDA backend so that the specialized kernels
+        // can apply the SINQ preconditioning directly on the device.  These registrations can
+        // be disabled temporarily (e.g. during model warmup) via
+        // llama_model::set_cuda_sinq_backend_enabled().  The CPU path keeps using the
+        // graph-level multiplication fallback.
 #if defined(GGML_USE_CUDA)
-        constexpr bool kEnableCudaSinqBackend = false;
-        if (kEnableCudaSinqBackend) {
+        if (pimpl->cuda_sinq_backend_enabled) {
             ggml_backend_cuda_tensor_set_sinq(
                 tensor,
                 scales.row.empty() ? nullptr : scales.row.data(), (int64_t) scales.row.size(),
@@ -6593,6 +6625,44 @@ const llama_model::llama_sinq_scales * llama_model::get_sinq_scales(const std::s
     }
     return &it->second;
 }
+
+bool llama_model::has_sinq_scales() const {
+    return !pimpl->sinq_by_name.empty();
+}
+
+#if defined(GGML_USE_CUDA)
+void llama_model::set_cuda_sinq_backend_enabled(bool enabled) const {
+    if (!has_sinq_scales()) {
+        return;
+    }
+
+    if (pimpl->cuda_sinq_backend_enabled == enabled) {
+        return;
+    }
+
+    pimpl->cuda_sinq_backend_enabled = enabled;
+
+    for (const auto & kv : pimpl->sinq_by_name) {
+        const auto * tensor = get_tensor(kv.first.c_str());
+        if (tensor == nullptr) {
+            continue;
+        }
+
+        if (enabled) {
+            ggml_backend_cuda_tensor_set_sinq(
+                tensor,
+                kv.second.row.empty() ? nullptr : kv.second.row.data(), (int64_t) kv.second.row.size(),
+                kv.second.col.empty() ? nullptr : kv.second.col.data(), (int64_t) kv.second.col.size());
+        } else {
+            ggml_backend_cuda_tensor_clear_sinq(tensor);
+        }
+    }
+}
+
+bool llama_model::cuda_sinq_backend_enabled() const {
+    return has_sinq_scales() && pimpl->cuda_sinq_backend_enabled;
+}
+#endif
 
 float llama_model::get_rope_freq_base (const llama_cparams & cparams, int il) const {
     return hparams.is_swa(il) ? hparams.rope_freq_base_train_swa : cparams.rope_freq_base;
