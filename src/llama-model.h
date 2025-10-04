@@ -505,6 +505,7 @@ struct llama_model {
 
     ggml_tensor * mul_mat_with_sinq(ggml_context * ctx, ggml_tensor * weight, ggml_tensor * input) const;
     ggml_tensor * mul_mat_id_with_sinq(ggml_context * ctx, ggml_tensor * weight, ggml_tensor * input, ggml_tensor * ids) const;
+    ggml_tensor * get_rows_with_sinq(ggml_context * ctx, ggml_tensor * weight, ggml_tensor * ids) const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;
@@ -518,6 +519,12 @@ struct llama_model {
     // TODO: move this to new llm_arch_model_i interface
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
 
+    friend void llama_model_test_set_sinq_scales(
+        llama_model & model,
+        const char * tensor_name,
+        const std::vector<float> & row,
+        const std::vector<float> & col);
+
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
@@ -528,3 +535,9 @@ const char * llm_type_name(llm_type type);
 // For internal test use
 // TODO: remove
 const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_tensor_map(const llama_model * model);
+
+void llama_model_test_set_sinq_scales(
+        llama_model & model,
+        const char * tensor_name,
+        const std::vector<float> & row,
+        const std::vector<float> & col);

@@ -540,6 +540,94 @@ ggml_tensor * llama_model::mul_mat_id_with_sinq(ggml_context * ctx, ggml_tensor 
     return result;
 }
 
+ggml_tensor * llama_model::get_rows_with_sinq(ggml_context * ctx, ggml_tensor * weight, ggml_tensor * ids) const {
+    const char * weight_name = ggml_get_name(weight);
+    const auto * scales = get_sinq_scales(weight_name);
+    if (scales == nullptr || (scales->row.empty() && scales->col.empty())) {
+        return ggml_get_rows(ctx, weight, ids);
+    }
+
+    const char * log_name = !scales->source_name.empty()
+        ? scales->source_name.c_str()
+        : (weight_name != nullptr ? weight_name : "<unnamed>");
+
+#if defined(GGML_USE_CUDA)
+    bool use_cuda_backend = false;
+    if (pimpl->cuda_sinq_backend_enabled && weight->buffer != nullptr && !ggml_backend_buffer_is_host(weight->buffer)) {
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(weight->buffer);
+        if (buft != nullptr) {
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                use_cuda_backend = true;
+            }
+        }
+    }
+    if (use_cuda_backend) {
+        return ggml_get_rows(ctx, weight, ids);
+    }
+#endif
+
+    const std::vector<float> * col_scales = &scales->col;
+    const std::vector<float> * row_scales = &scales->row;
+
+    const bool matches_direct =
+        (col_scales->empty() || (int64_t) col_scales->size() == weight->ne[0]) &&
+        (row_scales->empty() || (int64_t) row_scales->size() == weight->ne[1]);
+    const bool matches_transposed =
+        (col_scales->empty() || (int64_t) col_scales->size() == weight->ne[1]) &&
+        (row_scales->empty() || (int64_t) row_scales->size() == weight->ne[0]);
+
+    if (!matches_direct) {
+        if (matches_transposed) {
+            std::swap(col_scales, row_scales);
+        } else {
+            LLAMA_LOG_WARN(
+                "%s: ignoring SINQ scales for tensor '%s' due to shape mismatch (col = %zu, row = %zu, expected %lld x %lld or %lld x %lld)\n",
+                __func__, log_name,
+                col_scales->size(), row_scales->size(),
+                (long long) weight->ne[0], (long long) weight->ne[1],
+                (long long) weight->ne[1], (long long) weight->ne[0]);
+            return ggml_get_rows(ctx, weight, ids);
+        }
+    }
+
+    ggml_tensor * result = ggml_get_rows(ctx, weight, ids);
+
+    const char * base_weight_name = weight_name != nullptr ? weight_name : log_name;
+    std::string base_name(base_weight_name);
+
+    if (!col_scales->empty()) {
+        ggml_tensor * col = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, col_scales->size());
+        if (col->data != nullptr) {
+            std::memcpy(col->data, col_scales->data(), col_scales->size() * sizeof(float));
+        } else {
+            col->data = const_cast<float *>(col_scales->data());
+        }
+        std::string col_name = base_name + ".sinq_col";
+        ggml_set_name(col, col_name.c_str());
+        result = ggml_mul(ctx, result, ggml_repeat(ctx, col, result));
+    }
+
+    if (!row_scales->empty()) {
+        ggml_tensor * row_table = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, row_scales->size());
+        if (row_table->data != nullptr) {
+            std::memcpy(row_table->data, row_scales->data(), row_scales->size() * sizeof(float));
+        } else {
+            row_table->data = const_cast<float *>(row_scales->data());
+        }
+        std::string row_table_name = base_name + ".sinq_row_table";
+        ggml_set_name(row_table, row_table_name.c_str());
+
+        ggml_tensor * row = ggml_get_rows(ctx, row_table, ids);
+        std::string row_name = base_name + ".sinq_row";
+        ggml_set_name(row, row_name.c_str());
+
+        result = ggml_mul(ctx, result, ggml_repeat(ctx, row, result));
+    }
+
+    return result;
+}
+
 // GPU: split if LLAMA_SPLIT_MODE_ROW -> GPU
 static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode split_mode, const float * tensor_split) {
     buft_list_t buft_list;
@@ -7903,7 +7991,7 @@ struct llm_build_starcoder : public llm_graph_context {
 
         auto * inp_attn = build_attn_inp_kv();
 
-        ggml_tensor * pos = ggml_get_rows(ctx0, model.pos_embd, inp_pos);
+        ggml_tensor * pos = get_rows_with_sinq(model.pos_embd, inp_pos);
         cb(pos, "pos_embd", -1);
 
         inpL = ggml_add(ctx0, inpL, pos);
@@ -8114,7 +8202,7 @@ struct llm_build_bert : public llm_graph_context {
             inpL = ggml_add(ctx0, inpL, type_row0);
         }
         if (model.arch == LLM_ARCH_BERT) {
-            inpL = ggml_add(ctx0, ggml_get_rows(ctx0, model.pos_embd, inp_pos), inpL);
+            inpL = ggml_add(ctx0, get_rows_with_sinq(model.pos_embd, inp_pos), inpL);
         }
         cb(inpL, "inp_embd", -1);
 
@@ -8508,7 +8596,7 @@ struct llm_build_mpt : public llm_graph_context {
         if (model.pos_embd) {
             // inp_pos - contains the positions
             ggml_tensor * inp_pos = build_inp_pos();
-            pos = ggml_get_rows(ctx0, model.pos_embd, inp_pos);
+            pos = get_rows_with_sinq(model.pos_embd, inp_pos);
             cb(pos, "pos_embd", -1);
 
             inpL = ggml_add(ctx0, inpL, pos);
@@ -10159,7 +10247,7 @@ struct llm_build_gpt2 : public llm_graph_context {
 
         auto * inp_attn = build_attn_inp_kv();
 
-        pos = ggml_get_rows(ctx0, model.pos_embd, inp_pos);
+        pos = get_rows_with_sinq(model.pos_embd, inp_pos);
         cb(pos, "pos_embd", -1);
 
         inpL = ggml_add(ctx0, inpL, pos);
@@ -11493,7 +11581,7 @@ struct llm_build_gemma3n_iswa : public llm_graph_context {
             inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
             ggml_set_input(inp->tokens);
             res->t_tokens = inp->tokens;
-            inp_per_layer = ggml_get_rows(ctx0, model.tok_embd_per_layer, inp->tokens);
+            inp_per_layer = get_rows_with_sinq(model.tok_embd_per_layer, inp->tokens);
             inp_per_layer = ggml_reshape_3d(ctx0, inp_per_layer, n_embd_altup, n_layer, n_tokens);
             inp_per_layer = ggml_scale(ctx0, inp_per_layer, sqrtf((float)n_embd_altup));
             cb(inp_per_layer, "inp_per_layer_selected", -1);
@@ -20465,4 +20553,22 @@ bool llama_model_is_diffusion(const llama_model * model) {
 
 const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_tensor_map(const llama_model * model) {
     return model->tensors_by_name;
+}
+
+void llama_model_test_set_sinq_scales(
+        llama_model & model,
+        const char * tensor_name,
+        const std::vector<float> & row,
+        const std::vector<float> & col) {
+    std::string key = tensor_name != nullptr ? tensor_name : "";
+    if (key.size() >= GGML_MAX_NAME) {
+        key.resize(GGML_MAX_NAME - 1);
+    }
+
+    llama_model::llama_sinq_scales scales;
+    scales.row         = row;
+    scales.col         = col;
+    scales.source_name = tensor_name != nullptr ? tensor_name : "";
+
+    model.pimpl->sinq_by_name[key] = scales;
 }
