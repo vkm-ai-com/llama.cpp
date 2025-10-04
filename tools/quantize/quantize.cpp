@@ -134,7 +134,7 @@ static void usage(const char * executable) {
     printf("  --sinq: enable Sinkhorn-Normalized Quantization preconditioning for 2D weight tensors\n");
     printf("  --sinq-iters N: run N Sinkhorn iterations per tensor (default: %d)\n", llama_model_quantize_default_params().sinq_iterations);
     printf("  --sinq-min-std F: clamp per-axis standard deviations to be at least F during normalization (default: %.1e)\n", llama_model_quantize_default_params().sinq_min_std);
-    printf("  --sinq-max-log-delta F: limit per-iteration log-scale updates to +-F (default: %.1f)\n", llama_model_quantize_default_params().sinq_max_log_delta);
+    printf("  --sinq-max-log-delta F: deprecated compatibility flag (default: %.1f)\n", llama_model_quantize_default_params().sinq_max_log_delta);
     printf("  --prune-layers L0,L1,L2...comma-separated list of layer numbers to prune from the model\n");
     printf("      Advanced option to remove all tensors from the given layers\n");
     printf("  --keep-split: will generate quantized model in the same shards as input\n");

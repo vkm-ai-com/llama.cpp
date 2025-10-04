@@ -118,27 +118,37 @@ static void sinq_compute_col_std(const float * data, int64_t nrows, int64_t ncol
     }
 }
 
-static float sinq_min_positive(const std::vector<float> & values) {
-    float result = std::numeric_limits<float>::infinity();
-    for (float v : values) {
-        if (std::isfinite(v) && v > 0.0f) {
-            result = std::min(result, v);
-        }
-    }
-    if (!std::isfinite(result)) {
-        result = 0.0f;
-    }
-    return result;
-}
+static float sinq_compute_imbalance_from_std(
+        const std::vector<float> & row_std,
+        const std::vector<float> & col_std) {
 
-static float sinq_max_finite(const std::vector<float> & values) {
-    float result = 0.0f;
-    for (float v : values) {
+    float min_val = std::numeric_limits<float>::infinity();
+    float max_val = 0.0f;
+
+    auto update = [&](float v) {
         if (std::isfinite(v)) {
-            result = std::max(result, v);
+            min_val = std::min(min_val, v);
+            max_val = std::max(max_val, v);
         }
+    };
+
+    for (float v : row_std) {
+        update(v);
     }
-    return result;
+    for (float v : col_std) {
+        update(v);
+    }
+
+    if (!std::isfinite(min_val)) {
+        min_val = 0.0f;
+    }
+    min_val = std::max(min_val, 1e-12f);
+
+    if (!std::isfinite(max_val)) {
+        max_val = min_val;
+    }
+
+    return max_val / std::max(min_val, 1e-12f);
 }
 
 static bool llama_tensor_apply_sinq(
@@ -156,187 +166,193 @@ static bool llama_tensor_apply_sinq(
         return false;
     }
 
-    // Follow Algorithm 1 from "SINQ: Sinkhorn-Normalized Quantization for Calibration-Free
-    // Low-Precision LLM Weights" (https://arxiv.org/abs/2509.22944): copy the original matrix
-    // and alternately normalize column and row standard deviations via Sinkhorn-style updates.
-    // Section 2.2.1 of the paper further recommends accumulating the scale factors in the
-    // log-domain, clipping update magnitudes, and using imbalance-driven early stopping; we do
-    // the same below while keeping the per-axis floor sigma_min from Algorithm 1.
-    normalized.assign(original, original + (size_t) nrows * (size_t) ncols);
+    // Mirror sinkhorn_log from https://github.com/huawei-csl/SINQ to compute Sinkhorn-normalized
+    // row/column scales and the best-balanced preconditioned matrix encountered during the
+    // iteration.
+    const int iterations = std::max<int32_t>(0, params.sinq_iterations);
+    if (iterations == 0) {
+        normalized.assign(original, original + (size_t) nrows * (size_t) ncols);
+        row_scale.assign((size_t) nrows, 1.0f);
+        col_scale.assign((size_t) ncols, 1.0f);
+
+        std::vector<float> row_std;
+        std::vector<float> col_std;
+        sinq_compute_row_std(original, nrows, ncols, row_std);
+        sinq_compute_col_std(original, nrows, ncols, col_std);
+        imbalance_out = sinq_compute_imbalance_from_std(row_std, col_std);
+
+        LLAMA_LOG_DEBUG("%s: skipped SINQ normalization for %s (imbalance %.5f)\n",
+                __func__, tensor_name.c_str(), imbalance_out);
+        return true;
+    }
+
+    const float clip_min = std::max(params.sinq_min_std, 1e-3f);
+    const float clip_max = 1e3f;
+    const float eps      = 1e-6f;
+
+    normalized.resize((size_t) nrows * (size_t) ncols);
 
     std::vector<float> row_std_orig;
     std::vector<float> col_std_orig;
     sinq_compute_row_std(original, nrows, ncols, row_std_orig);
     sinq_compute_col_std(original, nrows, ncols, col_std_orig);
 
-    float sigma_min = std::min(sinq_min_positive(row_std_orig), sinq_min_positive(col_std_orig));
-    if (!std::isfinite(sigma_min) || sigma_min <= 0.0f) {
-        sigma_min = params.sinq_min_std;
-    } else {
-        sigma_min = std::max(params.sinq_min_std, sigma_min);
-    }
-    const float log_sigma_min = std::log(std::max(sigma_min, std::numeric_limits<float>::min()));
+    auto clamp_stat = [&](float v) {
+        if (!std::isfinite(v)) {
+            return clip_min;
+        }
+        return std::clamp(v, clip_min, clip_max);
+    };
 
-    std::vector<float> row_logs(nrows, 0.0f);
-    std::vector<float> col_logs(ncols, 0.0f);
+    float tgt_small = clip_min;
+    if (!row_std_orig.empty() && !col_std_orig.empty()) {
+        float row_min = clip_max;
+        for (float v : row_std_orig) {
+            row_min = std::min(row_min, clamp_stat(v));
+        }
+        float col_min = clip_max;
+        for (float v : col_std_orig) {
+            col_min = std::min(col_min, clamp_stat(v));
+        }
+
+        tgt_small = std::min(row_min, col_min);
+        if (!std::isfinite(tgt_small)) {
+            tgt_small = clip_min;
+        }
+        tgt_small = std::clamp(tgt_small, clip_min, clip_max);
+    }
+    tgt_small += eps;
+
+    std::vector<float> log_mu1((size_t) ncols, 0.0f);
+    std::vector<float> log_mu2((size_t) nrows, 0.0f);
+    std::vector<float> mu1((size_t) ncols, 1.0f);
+    std::vector<float> mu2((size_t) nrows, 1.0f);
+
+    std::vector<float> mu1_star = mu1;
+    std::vector<float> mu2_star = mu2;
+
+    std::vector<float> best_row_std = row_std_orig;
+    std::vector<float> best_col_std = col_std_orig;
+
+    const float imbalance_orig = sinq_compute_imbalance_from_std(row_std_orig, col_std_orig);
+    float imb_min = imbalance_orig;
+    if (!std::isfinite(imb_min)) {
+        imb_min = std::numeric_limits<float>::infinity();
+    }
+    float gate    = 0.0f;
+
+    std::vector<float> cur((size_t) nrows * (size_t) ncols);
     std::vector<float> row_std;
     std::vector<float> col_std;
 
-    std::vector<float> best_normalized;
-    std::vector<float> best_row_logs;
-    std::vector<float> best_col_logs;
-    std::vector<float> best_row_std;
-    std::vector<float> best_col_std;
+    std::vector<float> inv_mu1_tmp((size_t) ncols);
 
-    float best_imbalance = std::numeric_limits<float>::infinity();
-    int   stagnant_iters = 0;
-
-    for (int it = 0; it < params.sinq_iterations; ++it) {
-        sinq_compute_col_std(normalized.data(), nrows, ncols, col_std);
-        for (int64_t j = 0; j < ncols; ++j) {
-            float sigma = col_std[j];
-            if (!std::isfinite(sigma) || sigma <= 0.0f) {
-                sigma = sigma_min;
-            } else if (sigma < sigma_min) {
-                sigma = sigma_min;
+    auto compute_scaled = [&](const std::vector<float> & mu1_curr,
+                              const std::vector<float> & mu2_curr,
+                              std::vector<float> & out) {
+        for (size_t j = 0; j < mu1_curr.size(); ++j) {
+            float denom = mu1_curr[j];
+            if (!std::isfinite(denom) || denom == 0.0f) {
+                denom = 1.0f;
             }
-
-            float log_sigma = std::log(std::max(sigma, std::numeric_limits<float>::min()));
-            if (params.sinq_max_log_delta > 0.0f) {
-                log_sigma = std::clamp(log_sigma, -params.sinq_max_log_delta, params.sinq_max_log_delta);
-                if (log_sigma < log_sigma_min) {
-                    log_sigma = log_sigma_min;
-                }
-            }
-
-            sigma = std::exp(log_sigma);
-            if (!std::isfinite(sigma) || sigma <= 0.0f || sigma < sigma_min) {
-                sigma = sigma_min;
-                log_sigma = log_sigma_min;
-            }
-
-            col_logs[j] += log_sigma;
-            const float inv_sigma = sigma > 0.0f ? 1.0f / sigma : 0.0f;
-            if (inv_sigma != 1.0f) {
-                for (int64_t i = 0; i < nrows; ++i) {
-                    normalized[i * ncols + j] *= inv_sigma;
-                }
-            }
+            inv_mu1_tmp[j] = 1.0f / denom;
         }
-
-        sinq_compute_row_std(normalized.data(), nrows, ncols, row_std);
         for (int64_t i = 0; i < nrows; ++i) {
-            float sigma = row_std[i];
-            if (!std::isfinite(sigma) || sigma <= 0.0f) {
-                sigma = sigma_min;
-            } else if (sigma < sigma_min) {
-                sigma = sigma_min;
+            float denom = mu2_curr[(size_t) i];
+            if (!std::isfinite(denom) || denom == 0.0f) {
+                denom = 1.0f;
             }
-
-            float log_sigma = std::log(std::max(sigma, std::numeric_limits<float>::min()));
-            if (params.sinq_max_log_delta > 0.0f) {
-                log_sigma = std::clamp(log_sigma, -params.sinq_max_log_delta, params.sinq_max_log_delta);
-                if (log_sigma < log_sigma_min) {
-                    log_sigma = log_sigma_min;
-                }
-            }
-
-            sigma = std::exp(log_sigma);
-            if (!std::isfinite(sigma) || sigma <= 0.0f || sigma < sigma_min) {
-                sigma = sigma_min;
-                log_sigma = log_sigma_min;
-            }
-
-            row_logs[i] += log_sigma;
-            const float inv_sigma = sigma > 0.0f ? 1.0f / sigma : 0.0f;
-            if (inv_sigma != 1.0f) {
-                float * row = normalized.data() + i * ncols;
-                for (int64_t j = 0; j < ncols; ++j) {
-                    row[j] *= inv_sigma;
-                }
+            const float inv_mu2 = 1.0f / denom;
+            const float * src_row = original + i * ncols;
+            float * dst_row = out.data() + (size_t) i * (size_t) ncols;
+            for (int64_t j = 0; j < ncols; ++j) {
+                dst_row[j] = src_row[j] * inv_mu2 * inv_mu1_tmp[(size_t) j];
             }
         }
+    };
 
-        sinq_compute_col_std(normalized.data(), nrows, ncols, col_std);
-        sinq_compute_row_std(normalized.data(), nrows, ncols, row_std);
+    compute_scaled(mu1, mu2, cur);
 
-        float min_curr = std::min(sinq_min_positive(row_std), sinq_min_positive(col_std));
-        if (!std::isfinite(min_curr) || min_curr <= 0.0f) {
-            min_curr = sigma_min;
+    for (int it = 0; it < iterations; ++it) {
+        sinq_compute_row_std(cur.data(), nrows, ncols, row_std);
+        sinq_compute_col_std(cur.data(), nrows, ncols, col_std);
+
+        float ib = sinq_compute_imbalance_from_std(row_std, col_std);
+        if (!std::isfinite(ib)) {
+            gate = 1.0f;
+            break;
         }
-        float max_curr = std::max(sinq_max_finite(row_std), sinq_max_finite(col_std));
-        if (!std::isfinite(max_curr) || max_curr <= 0.0f) {
-            max_curr = sigma_min;
+        if (ib <= imb_min) {
+            mu1_star = mu1;
+            mu2_star = mu2;
+            best_row_std = row_std;
+            best_col_std = col_std;
         }
-        const float imbalance_curr = max_curr / std::max(min_curr, params.sinq_min_std);
+        imb_min = std::min(imb_min, ib);
 
-        // Early-stop once the imbalance proxy ceases to improve, mirroring the stabilization
-        // heuristic suggested in the SINQ paper.
-
-        if (imbalance_curr + 1e-4f < best_imbalance) {
-            best_imbalance = imbalance_curr;
-            stagnant_iters = 0;
-
-            best_normalized = normalized;
-            best_row_logs   = row_logs;
-            best_col_logs   = col_logs;
-            best_row_std    = row_std;
-            best_col_std    = col_std;
-        } else {
-            ++stagnant_iters;
-            if (stagnant_iters >= 2) {
-                if (!best_normalized.empty()) {
-                    normalized     = best_normalized;
-                    row_logs       = best_row_logs;
-                    col_logs       = best_col_logs;
-                    row_std        = best_row_std;
-                    col_std        = best_col_std;
-                }
-                break;
-            }
+        if (ib > imb_min) {
+            gate = std::min(1.0f, gate + 1.0f);
         }
-    }
 
-    if (!best_normalized.empty()) {
-        normalized = best_normalized;
-        row_logs   = best_row_logs;
-        col_logs   = best_col_logs;
-    }
-
-    if (best_imbalance == std::numeric_limits<float>::infinity()) {
-        if (row_std.empty() || col_std.empty()) {
-            sinq_compute_row_std(normalized.data(), nrows, ncols, row_std);
-            sinq_compute_col_std(normalized.data(), nrows, ncols, col_std);
+        const float g = 1.0f - gate;
+        if (g <= 0.0f) {
+            break;
         }
-    } else {
-        row_std = best_row_std;
-        col_std = best_col_std;
+
+        for (int64_t j = 0; j < ncols; ++j) {
+            float sigma = clamp_stat(col_std[(size_t) j]);
+            float ratio = sigma / tgt_small;
+            ratio = std::clamp(ratio, 0.7f, 2.0f);
+            const float delta = std::log(std::max(ratio, 1e-12f));
+            log_mu1[(size_t) j] = std::clamp(log_mu1[(size_t) j] + g * delta, -0.3f, 10.0f);
+            mu1[(size_t) j] = std::exp(log_mu1[(size_t) j]);
+        }
+
+        for (int64_t i = 0; i < nrows; ++i) {
+            float sigma = clamp_stat(row_std[(size_t) i]);
+            float ratio = sigma / tgt_small;
+            ratio = std::clamp(ratio, 0.7f, 2.0f);
+            const float delta = std::log(std::max(ratio, 1e-12f));
+            log_mu2[(size_t) i] = std::clamp(log_mu2[(size_t) i] + g * delta, -0.3f, 10.0f);
+            mu2[(size_t) i] = std::exp(log_mu2[(size_t) i]);
+        }
+
+        compute_scaled(mu1, mu2, cur);
     }
 
-    float min_final = std::min(sinq_min_positive(row_std), sinq_min_positive(col_std));
-    if (!std::isfinite(min_final) || min_final <= 0.0f) {
-        min_final = sigma_min;
-    }
-    float max_final = std::max(sinq_max_finite(row_std), sinq_max_finite(col_std));
-    if (!std::isfinite(max_final) || max_final <= 0.0f) {
-        max_final = sigma_min;
-    }
-    if (best_imbalance == std::numeric_limits<float>::infinity()) {
-        imbalance_out = max_final / std::max(min_final, params.sinq_min_std);
-    } else {
-        imbalance_out = best_imbalance;
-    }
+    compute_scaled(mu1_star, mu2_star, normalized);
 
-    row_scale.resize(nrows);
-    col_scale.resize(ncols);
+    row_scale.resize((size_t) nrows);
     for (int64_t i = 0; i < nrows; ++i) {
-        row_scale[i] = std::exp(row_logs[i]);
-    }
-    for (int64_t j = 0; j < ncols; ++j) {
-        col_scale[j] = std::exp(col_logs[j]);
+        float scale = mu2_star[(size_t) i];
+        if (!std::isfinite(scale) || scale <= 0.0f) {
+            scale = 1.0f;
+        }
+        row_scale[(size_t) i] = scale;
     }
 
-    LLAMA_LOG_DEBUG("%s: applied SINQ normalization to %s (imbalance %.5f)\n", __func__, tensor_name.c_str(), imbalance_out);
+    col_scale.resize((size_t) ncols);
+    for (int64_t j = 0; j < ncols; ++j) {
+        float scale = mu1_star[(size_t) j];
+        if (!std::isfinite(scale) || scale <= 0.0f) {
+            scale = 1.0f;
+        }
+        col_scale[(size_t) j] = scale;
+    }
+
+    const float best_imbalance = sinq_compute_imbalance_from_std(best_row_std, best_col_std);
+    if (std::isfinite(best_imbalance)) {
+        imbalance_out = best_imbalance;
+    } else {
+        std::vector<float> final_row_std;
+        std::vector<float> final_col_std;
+        sinq_compute_row_std(normalized.data(), nrows, ncols, final_row_std);
+        sinq_compute_col_std(normalized.data(), nrows, ncols, final_col_std);
+        imbalance_out = sinq_compute_imbalance_from_std(final_row_std, final_col_std);
+    }
+
+    LLAMA_LOG_DEBUG("%s: applied SINQ normalization to %s (imbalance %.5f)\n",
+            __func__, tensor_name.c_str(), imbalance_out);
 
     return true;
 }
@@ -1402,8 +1418,8 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.pure                        =*/ false,
         /*.keep_split                  =*/ false,
         /*.use_sinq                    =*/ false,
-        /*.sinq_iterations             =*/ 6,
-        /*.sinq_min_std                =*/ 1e-6f,
+        /*.sinq_iterations             =*/ 8,
+        /*.sinq_min_std                =*/ 1e-3f,
         /*.sinq_max_log_delta          =*/ 2.0f,
         /*.imatrix                     =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
